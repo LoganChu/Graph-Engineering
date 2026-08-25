@@ -1,0 +1,113 @@
+id: relocation
+description: >
+  A year of scattered personal updates. Facts are stated once, revised later,
+  and never restated. Tests whether a store can revise a belief rather than
+  accumulate contradictory copies of it.
+
+turns:
+  - t: 2025-01-08
+    text: "I start my PhD at Duke next week. Moving to Durham on Sunday."
+  - t: 2025-01-08
+    text: "My advisor is Priya Raghavan. She runs the systems lab."
+  - t: 2025-01-19
+    text: "Signed a lease on Ninth Street. One bedroom, way too expensive."
+  - t: 2025-02-02
+    text: "Adopted a cat from the shelter. Named her Miso."
+  - t: 2025-02-14
+    text: "Miso is allergic to chicken, apparently. Switched her to the fish food."
+  - t: 2025-02-27
+    text: "Priya wants me on the caching paper. Deadline is in June."
+  - t: 2025-03-10
+    text: "My sister Rachel is visiting next month. She lives in Philadelphia."
+  - t: 2025-03-22
+    text: "Rachel works at a hospital there, she's a pediatric nurse."
+  - t: 2025-04-05
+    text: "Rachel came down. We drove to Asheville for the weekend."
+  - t: 2025-04-30
+    text: "Bad news, the caching paper got rejected. Reviewer 2 hated the eval."
+  - t: 2025-05-11
+    text: "Priya is going on sabbatical in the fall. Marcus Oyelaran will co-advise me."
+  - t: 2025-06-03
+    text: "Resubmitting the caching paper to SOSP. New eval section this time."
+  - t: 2025-07-15
+    text: "I'm switching my focus to graph databases. Marcus's area, not Priya's."
+  - t: 2025-08-20
+    text: "Miso got into the neighbor's yard again. Third time this month."
+  - t: 2025-09-02
+    text: "Lease is up in December and I'm not renewing. Ninth Street is too loud."
+  - t: 2025-10-14
+    text: "SOSP accepted the paper! Camera ready is due in three weeks."
+  - t: 2025-11-08
+    text: "Found a place in Chapel Hill. Moving December 15th, and it's cheaper."
+  - t: 2025-12-16
+    text: "Moved yesterday. Chapel Hill is much quieter, Miso hates the change."
+  - t: 2026-01-09
+    text: "Rachel took a job in Boston. She moved last week."
+  - t: 2026-02-03
+    text: "Marcus is my primary advisor now. Priya stayed on sabbatical permanently."
+
+probes:
+  - after_turn: 4
+    type: simple_recall
+    question: "What is my cat's name?"
+    expected: "Miso"
+
+  - after_turn: 9
+    type: multi_hop
+    question: "What does my sister do for a living, and in which city?"
+    expected: "Rachel is a pediatric nurse in Philadelphia."
+
+  - after_turn: 12
+    type: temporal
+    question: "Who is my advisor?"
+    expected: "Priya Raghavan, with Marcus Oyelaran co-advising from the fall."
+    as_of: 2025-06-10
+
+  - after_turn: 18
+    type: contradiction
+    question: "Where do I live?"
+    expected: "Chapel Hill"
+    must_not_contain: ["Durham", "Ninth Street"]
+
+  - after_turn: 18
+    type: simple_recall
+    question: "What food can my cat not eat?"
+    expected: "Chicken -- she is allergic to it."
+
+  - after_turn: 18
+    type: temporal
+    question: "Where was I living in March 2025?"
+    expected: "Durham, on Ninth Street."
+    as_of: 2025-03-15
+
+  - after_turn: 20
+    type: contradiction
+    question: "Who is my primary advisor?"
+    expected: "Marcus Oyelaran"
+    must_not_contain: ["Priya"]
+
+  - after_turn: 20
+    type: multi_hop
+    question: "Which conference accepted the paper that was rejected earlier in the year?"
+    expected: "SOSP accepted the caching paper after its earlier rejection."
+
+  - after_turn: 20
+    type: contradiction
+    question: "Where does my sister live?"
+    expected: "Boston"
+    must_not_contain: ["Philadelphia"]
+
+  - after_turn: 20
+    type: negation
+    question: "What is my cat's veterinarian called?"
+    expected: "Never stated -- the correct answer is that this is unknown."
+
+  - after_turn: 20
+    type: aggregation
+    question: "How many times did I move during this period, and to where?"
+    expected: "Twice: to Durham in January 2025, then to Chapel Hill in December 2025."
+
+  - after_turn: 20
+    type: negation
+    question: "What did I say about my stipend amount?"
+    expected: "Never mentioned -- the correct answer is that this is unknown."
