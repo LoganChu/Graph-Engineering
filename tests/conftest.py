@@ -2,6 +2,12 @@
 
 The stub still records Usage against the ledger, which means the cost
 attribution path -- the part most likely to silently break -- is covered too.
+
+It also speaks `chat()` with tool calls, so the loop and graph orchestrators run
+offline against it. Two knobs drive them: `tool_hops` is how many times the
+"model" asks to search before answering, and `assess_hops` is how many times the
+graph's assessment reports the evidence insufficient. Scripting those is what
+lets the tests assert on cycle behaviour without a model that might not cycle.
 """
 
 from __future__ import annotations
@@ -11,17 +17,27 @@ from datetime import date
 import pytest
 
 from arena.llm import Ledger
+from arena.providers import Completion, ToolCall
 from arena.types import Event, Probe, Task, Usage
 
 
 class StubLLM:
     """Mimics arena.llm.LLM. Canned extraction, echo answers, keyword judging."""
 
-    def __init__(self, ledger: Ledger | None = None) -> None:
+    def __init__(
+        self,
+        ledger: Ledger | None = None,
+        *,
+        tool_hops: int = 1,
+        assess_hops: int = 0,
+    ) -> None:
         self.ledger = ledger or Ledger()
         self.model = "stub"
         self.effort = "low"
         self.calls: list[tuple[str, str]] = []
+        self.tool_hops = tool_hops
+        self.assess_hops = assess_hops
+        self.assessments = 0
 
     def _bill(self, phase: str, prompt: str, out: int = 20) -> None:
         self.ledger.add(
@@ -50,12 +66,78 @@ class StubLLM:
             return schema(facts=[])
         if fields == {"grade", "reason"}:
             return schema(grade="incorrect", reason="stub judge")
+        if fields == {"sufficient", "missing", "next_query"}:
+            # The graph orchestrator's routing decision. Report "not yet" for
+            # the scripted number of cycles, then stop -- otherwise the only
+            # thing ending the loop would be the hop cap, and the test could not
+            # tell a working exit condition from a working cap.
+            self.assessments += 1
+            if self.assessments <= self.assess_hops:
+                return schema(
+                    sufficient=False,
+                    missing="the other half",
+                    next_query=f"reformulated query {self.assessments}",
+                )
+            return schema(sufficient=True, missing="", next_query="")
         raise AssertionError(f"StubLLM has no canned response for {schema!r}")
+
+    def chat(self, messages, *, phase, system=None, tools=None, max_tokens=1000):
+        """Mimics a tool-calling model: search `tool_hops` times, then answer."""
+        self.calls.append(("chat", str(messages)))
+        searched = [m for m in messages if m.get("role") == "tool"]
+        prompt = str(messages)
+
+        if tools and len(searched) < self.tool_hops:
+            question = next(
+                (m.get("content", "") for m in messages if m.get("role") == "user"), ""
+            )
+            got = Completion(
+                text="",
+                input_tokens=max(len(prompt) // 4, 1),
+                output_tokens=20,
+                tool_calls=(
+                    ToolCall(
+                        id=f"call_{len(searched)}",
+                        name="recall",
+                        args={"query": question},
+                    ),
+                ),
+            )
+        else:
+            # Echo the evidence, so grading depends on what recall returned --
+            # the same contract the `complete()` answer path honours.
+            evidence = "\n".join(m.get("content", "") for m in searched)
+            got = Completion(
+                text=(evidence or "I don't know.")[:400],
+                input_tokens=max(len(prompt) // 4, 1),
+                output_tokens=20,
+            )
+
+        resolved = phase if isinstance(phase, str) else phase(got)
+        self.ledger.add(
+            Usage(
+                phase=resolved,
+                model="stub",
+                input_tokens=got.input_tokens,
+                output_tokens=got.output_tokens,
+            )
+        )
+        return got
 
 
 @pytest.fixture
 def stub_factory():
     return lambda ledger: StubLLM(ledger)
+
+
+@pytest.fixture
+def stub_factory_for():
+    """Build a stub factory with the cycle knobs set."""
+
+    def make(**kwargs):
+        return lambda ledger: StubLLM(ledger, **kwargs)
+
+    return make
 
 
 @pytest.fixture
