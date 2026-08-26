@@ -3,7 +3,16 @@ __pycache__/
 .venv/
 venv/
 .env
-results/cache/
-results/runs/
 *.egg-info/
 .pytest_cache/
+.coverage
+
+# Benchmark output: summary.json, runs.json, table.md, charts, and the
+# content-addressed response cache. All of it regenerates from the corpus, and
+# committing it means a binary diff on every run.
+results/
+
+# The corpus itself. Built from LongMemEval, which is 278 MB of raw JSON
+# upstream -- fetch and convert it instead of checking it in:
+#   python scripts/build_longmemeval.py
+tasks/longmemeval/
