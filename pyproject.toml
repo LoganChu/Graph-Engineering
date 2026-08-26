@@ -17,6 +17,16 @@ dependencies = [
 # The vector backend needs local embeddings. Kept optional so the base install
 # stays light and offline-runnable.
 embeddings = ["sentence-transformers>=3.0"]
+local = [
+    "openai>=3.3.1",
+]
+# The orchestration axis. LangChain/LangGraph are only needed for the `loop`
+# and `graph` orchestrators; `single_shot` (the historical behaviour) has no
+# such dependency, so the base install stays offline-runnable.
+orchestration = [
+    "langchain>=1.0",
+    "langgraph>=1.0",
+]
 
 [project.scripts]
 arena = "arena.cli:main"
