@@ -9,12 +9,15 @@ import pytest
 
 from arena import backends, report, runner, tasks  # noqa: F401
 from arena.judge import grade, score
-from arena.llm import Ledger, cost_usd
+from arena.llm import Ledger, ModelConfig, cost_usd
 from arena.types import Probe, Usage
 
 from .conftest import StubLLM
 
-TASK_DIR = Path(__file__).resolve().parents[1] / "tasks"
+# The hand-authored pair. The default corpus is now LongMemEval, generated into
+# tasks/longmemeval/ and gitignored, so it cannot be what these tests assert on
+# -- and `as_of` only ever appears here, since imported probes carry no date.
+TASK_DIR = Path(__file__).resolve().parents[1] / "tasks" / "handwritten"
 
 
 class TestTaskLoading:
@@ -92,8 +95,7 @@ class TestOfflineMatrix:
         results = runner.run_matrix(
             self.BACKENDS,
             [tiny_task],
-            model="stub",
-            effort="low",
+            config=ModelConfig(model="stub"),
             cache_dir=tmp_path,
             llm_factory=stub_factory,
         )
@@ -136,8 +138,7 @@ class TestOfflineMatrix:
         result = runner.run_cell(
             "full_transcript",
             task,
-            model="stub",
-            effort="low",
+            config=ModelConfig(model="stub"),
             token_budget=2000,
             cache_dir=tmp_path,
             llm_factory=stub_factory,
