@@ -26,16 +26,26 @@ from ..types import Event, Recall
 EXTRACT = """\
 Extract factual triples from this conversation turn.
 
-Turn (dated {when}): {speaker}: {text}
+Turn (dated {when}), spoken by {speaker}: {text}
 
 Rules:
-- Subject and object are short noun phrases. Resolve pronouns to the speaker's
-  name when obvious, otherwise use "user".
-- Relation is a short lowercase verb phrase, e.g. "lives in", "works at",
-  "prefers", "is allergic to", "owns".
-- Extract only what this turn actually asserts. No inference, no world
-  knowledge. If the turn asserts nothing factual, return an empty list.
-- Split compound statements into separate triples."""
+- The SUBJECT is the entity the statement is about. This is often NOT the
+  speaker. "Checkout service paged at 3am" is about the checkout service, not
+  about {speaker}. Only use the speaker as the subject when the statement is
+  about them ("I moved to Boston" -> subject is {speaker}).
+- Resolve first-person pronouns to {speaker}. Resolve other pronouns to the
+  entity they refer to if it is unambiguous; skip the triple if it is not.
+- The RELATION is a short lowercase verb phrase drawn from the turn's own
+  wording. Do not force the statement into a vocabulary the turn does not use.
+- The OBJECT is a short noun phrase or literal value. Keep it under six words.
+- Extract only what this turn asserts. No inference, no world knowledge. If the
+  turn asserts nothing factual, return an empty list.
+- Split compound statements into separate triples.
+
+Example turn: "Checkout paged again, same latency shape as before. Sam owns it now."
+Example output: two triples --
+  (checkout, paged, again) and (sam, owns, checkout)
+Note that neither triple is anchored on the speaker."""
 
 
 class Fact(BaseModel):

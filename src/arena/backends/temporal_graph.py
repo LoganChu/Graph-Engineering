@@ -109,11 +109,24 @@ class TemporalGraph(EntityGraph):
     # -- read ----------------------------------------------------------------
 
     def _relevant(self, query: str) -> list[Version]:
-        seeds = set(self._seeds(query))
-        picked: list[Version] = []
-        for (subject, _), history in self.versions.items():
-            if subject in seeds:
-                picked.extend(history)
+        """Seed, walk the graph, then collect the versions those edges touch.
+
+        Matching seeds against subjects alone silently drops every fact where
+        the query term is the *object* -- asking "who owns checkout?" would miss
+        `sam --owns--> checkout` entirely, because "checkout" is not a subject.
+        Reusing the k-hop walk fixes the asymmetry and picks up neighbors of the
+        matched entity for free, which is the whole reason to keep a graph.
+        """
+        seeds = self._seeds(query)
+        touched: set[tuple[str, str]] = set()
+        for src, data, dst in self._neighborhood(seeds):
+            touched.add((src, data["relation"]))
+            # An edge is evidence for its endpoints in both directions.
+            touched.update(
+                key for key in self.versions if key[0] == dst or key[0] == src
+            )
+
+        picked = [v for key in touched for v in self.versions.get(key, ())]
         if not picked:  # fall back to everything rather than answering blind
             picked = [v for h in self.versions.values() for v in h]
         return picked
