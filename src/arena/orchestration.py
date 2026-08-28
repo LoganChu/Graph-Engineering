@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from datetime import date
 from typing import Callable
 
 from .llm import LLM
@@ -72,9 +71,8 @@ class Retriever:
     comparable across three very different control-flow styles.
     """
 
-    def __init__(self, store: Memory, as_of: date | None = None) -> None:
+    def __init__(self, store: Memory) -> None:
         self.store = store
-        self.as_of = as_of
         self.hops = 0
         self.chars = 0
         self.latency_s = 0.0
@@ -86,7 +84,7 @@ class Retriever:
 
     def fetch(self, query: str) -> Recall:
         started = time.perf_counter()
-        recall = self.store.recall(query, as_of=self.as_of)
+        recall = self.store.recall(query)
         self.latency_s += time.perf_counter() - started
         self.hops += 1
         self.chars += len(recall.context)
@@ -123,6 +121,6 @@ class Orchestrator(ABC):
         self.max_hops = max_hops
 
     @abstractmethod
-    def run(self, store: Memory, question: str, as_of: date | None = None) -> Attempt:
+    def run(self, store: Memory, question: str) -> Attempt:
         """Answer one probe. Implementations must route retrieval through
         `Retriever` so the hop accounting stays honest."""

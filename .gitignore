@@ -16,3 +16,7 @@ results/
 # upstream -- fetch and convert it instead of checking it in:
 #   python scripts/build_longmemeval.py
 tasks/longmemeval/
+
+# Same for LoCoMo -- built by scripts/build_locomo.py, which caches the
+# 2.8 MB upstream JSON under results/cache/ (already ignored above).
+tasks/locomo/

@@ -20,10 +20,10 @@ from .orchestration import get_orchestrator
 console = Console()
 OLLAMA_URL = "http://localhost:11434/v1"
 
-#: The corpus is LongMemEval, generated into this directory rather than checked
-#: in -- the `s` variant is 278 MB of raw JSON upstream. The two hand-authored
-#: YAML tasks now live in tasks/handwritten/ and are no longer on the default
-#: path; point --tasks at them if you want the old offline smoke run.
+#: Both corpora are generated rather than checked in -- LongMemEval's `s`
+#: variant is 278 MB of raw JSON upstream. LongMemEval is the default because it
+#: is the cheaper of the two to ingest; point --tasks at tasks/locomo for the
+#: deeper haystacks and the distractor-guarded probes.
 DEFAULT_TASKS = "tasks/longmemeval"
 BUILD_HINT = "python scripts/build_longmemeval.py"
 

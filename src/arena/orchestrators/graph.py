@@ -31,7 +31,6 @@ evidence.
 
 from __future__ import annotations
 
-from datetime import date
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -103,8 +102,8 @@ class GraphAgent(Orchestrator):
 
     blurb = "LangGraph StateGraph -- an explicit retrieve/assess cycle with a declared exit."
 
-    def run(self, store: Memory, question: str, as_of: date | None = None) -> Attempt:
-        retriever = Retriever(store, as_of)
+    def run(self, store: Memory, question: str) -> Attempt:
+        retriever = Retriever(store)
 
         def retrieve(state: State) -> dict:
             recall = retriever.fetch(state["query"])

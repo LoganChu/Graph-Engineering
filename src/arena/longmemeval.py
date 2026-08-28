@@ -33,17 +33,15 @@ evidence, versus the store found it and the agent fumbled it.
 Task files built before this existed still load -- they simply carry no session
 ids and score `None` for evidence. Re-run the builder to pick it up.
 
-Two things the dataset cannot give us, both harness features that go unused:
+One thing the dataset cannot give us: `must_not_contain`. The hard-fail guard
+needs a distractor string and LongMemEval ships no such annotation, so imported
+probes carry no guard and a `knowledge-update` answer naming the superseded fact
+alongside the current one is graded by the judge alone. LoCoMo does supply
+distractors -- see `locomo.py` -- which is part of why it is worth having both.
 
-  * `must_not_contain`. Our hard-fail guard needs a distractor string, and
-    LongMemEval ships no such annotation. Imported probes carry no guard, so a
-    `knowledge-update` answer that names the superseded fact alongside the
-    current one is graded by the judge alone.
-  * `as_of`. LongMemEval puts the temporal reference in the question text
-    ("...after its first service"), not in a separate field, so there is no date
-    to query the store at. `temporal_graph` therefore answers temporal questions
-    from its current-facts branch, which is the correct behaviour here: it shows
-    the model both live and superseded facts and lets the question select.
+Temporal reference lives in the question text here ("...after its first
+service") rather than in a field, which is true of every corpus we surveyed and
+is why the harness no longer carries an `as_of` query parameter at all.
 """
 
 from __future__ import annotations

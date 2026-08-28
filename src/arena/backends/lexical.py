@@ -11,7 +11,6 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from datetime import date
 
 from ..memory import Memory, register
 from ..types import Event, Recall
@@ -63,7 +62,7 @@ class BM25(Memory):
             total += idf * (f * (K1 + 1)) / (f + K1 * (1 - B + B * dl / avgdl))
         return total
 
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
+    def recall(self, query: str) -> Recall:
         if not self.events:
             return Recall(context="(no memories)", note="empty")
         terms = tokenize(query)

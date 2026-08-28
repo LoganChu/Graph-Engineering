@@ -9,9 +9,16 @@ Two clocks per fact:
     valid_from / valid_to -- when the fact was true in the world
     ingested_at           -- when the system learned it
 
-That second clock is what lets you ask "what did the system believe on March 1"
-as distinct from "what was actually true on March 1", which is the query no
-similarity search can answer at all.
+The write path is what is measured: a differing assertion on a single-valued
+relation closes the open version instead of stacking beside it, so `recall` can
+hand the model a CURRENT block and a separate NO LONGER TRUE block rather than
+two contradictory sentences and a hope that recency wins.
+
+That second clock once also backed an as-of read ("what did the system believe
+on March 1"). It is gone. No corpus in the arena -- and, as far as we could
+find, no published memory benchmark -- ships a *query* timestamp as a field;
+they all put temporal reference in the question text. It was unreachable code
+claiming a capability nothing exercised.
 """
 
 from __future__ import annotations
@@ -39,11 +46,6 @@ class Version:
     @property
     def open(self) -> bool:
         return self.valid_to is None
-
-    def alive_at(self, when: date) -> bool:
-        if when < self.valid_from:
-            return False
-        return self.valid_to is None or when < self.valid_to
 
     def render(self) -> str:
         if self.open:
@@ -131,23 +133,11 @@ class TemporalGraph(EntityGraph):
             picked = [v for h in self.versions.values() for v in h]
         return picked
 
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
+    def recall(self, query: str) -> Recall:
         if not self.versions:
             return Recall(context="(no memories)", note="empty store")
 
         candidates = self._relevant(query)
-
-        if as_of is not None:
-            live = [v for v in candidates if v.alive_at(as_of)]
-            body = "\n".join(v.render() for v in sorted(live, key=lambda v: v.valid_from))
-            return Recall(
-                context=(
-                    f"FACTS TRUE AS OF {as_of.isoformat()} "
-                    "(the store was queried at that point in time):\n" + (body or "(none)")
-                ),
-                provenance=tuple(str(v.turn_id) for v in live),
-                note=f"as-of query, {len(live)} live facts",
-            )
 
         current = [v for v in candidates if v.open]
         retired = [v for v in candidates if not v.open]

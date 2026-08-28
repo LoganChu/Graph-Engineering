@@ -34,7 +34,7 @@ class Memory(ABC):
     def observe(self, event: Event) -> None:
         """WRITE policy: what to store, in what form, at what cost."""
 
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
+    def recall(self, query: str) -> Recall:
         """READ policy: what earns a place in the context window."""
 ```
 
@@ -58,7 +58,7 @@ and they differ in exactly one respect: who owns the decision to search again.
 
 ```python
 class Orchestrator(ABC):
-    def run(self, store: Memory, question: str, as_of: date | None) -> Attempt:
+    def run(self, store: Memory, question: str) -> Attempt:
         """CONTROL FLOW: how many times to go back, and with what query."""
 ```
 
@@ -175,25 +175,43 @@ turn ingested, so the full `s` split is **246,930 extraction calls per backend**
 Subset it; `--limit` stratifies across probe types so the by-type table stays
 readable.
 
-Three honest caveats:
+Two honest caveats, both of which are why LoCoMo is also in the tree:
 
-- **`aggregation` goes unpopulated.** LongMemEval has no equivalent category, and
-  reclassifying `multi-session` questions by heuristic would be inventing labels.
-  It remains covered only by the hand-authored tasks.
-- **`must_not_contain` is lost.** The hard-fail guard needs a distractor string
-  and the dataset ships no such annotation, so imported `contradiction` probes
-  are graded by the judge alone.
-- **`as_of` is lost.** LongMemEval puts the temporal reference in the question
-  text rather than a separate field, so there is no date to query the store at.
-  Every probe fires at the final turn, which also leaves the `after_turn`
-  machinery unexercised.
+- **`aggregation` goes unpopulated.** LongMemEval has no equivalent category,
+  and reclassifying `multi-session` questions by heuristic would be inventing
+  labels. Neither corpus fills it; it is the one probe type with no data.
+- **`must_not_contain` is unfilled *here*.** The hard-fail guard needs a
+  distractor string and this dataset ships none, so imported `contradiction`
+  probes are graded by the judge alone. LoCoMo does ship them.
 
-Those three are exactly what the hand-authored pair still exercises, so it is
-kept as an offline smoke test rather than deleted:
+Every probe also fires at the final turn, which leaves the `after_turn`
+machinery — asking a question *before* the contradicting turn lands — unused on
+both imported corpora.
+
+### The second corpus is LoCoMo
+
+LongMemEval's `oracle` split is nearly all needle: a median of 24 turns per
+question, only evidence-bearing sessions. [LoCoMo](https://github.com/snap-research/locomo)
+(Maharana et al., ACL 2024) is the opposite — 369–689 turns across 19–32
+sessions, interrogated ~200 times each.
 
 ```bash
-uv run arena run --tasks tasks/handwritten
+python scripts/build_locomo.py              # 3 conversations, 40 probes each
+python scripts/build_locomo.py -c 10 -p 60  # more of both
+uv run arena run --tasks tasks/locomo
 ```
+
+Three things it buys that LongMemEval cannot:
+
+| | |
+|---|---|
+| **A real haystack** | Retrieval precision and efficiency were pinned at 1.00 on `oracle` because everything retrieved was gold. On LoCoMo, `bm25` scores recall 0.81 / precision 0.17 — numbers with signal in them. |
+| **Distractors** | Category-5 questions are adversarial: they attribute an event to the wrong speaker, and `adversarial_answer` holds the answer a fooled model gives. That is exactly `must_not_contain`, and it makes the deterministic gate live. |
+| **Probes per haystack** | One conversation is ingested once and asked ~200 questions, against LongMemEval's one question per haystack. Roughly 8× more probe per extraction call — and the first corpus that makes `report.score_stat`'s cluster-by-task interval do real work. |
+
+Category 3 (`open-domain`) is dropped rather than mapped: those questions are
+answered from world knowledge, and the agent is forced closed-book, so scoring
+them would measure prompt compliance rather than memory.
 
 ---
 
@@ -421,16 +439,22 @@ judge call is spent. Everything else goes to a rubric judge.
    "who owns checkout?" retrieved nothing because "checkout" appears as an
    object. Fixed by routing retrieval through the k-hop walk; locked in by
    `tests/test_graph_retrieval.py`.
-5. **The corpus is the `oracle` split, subsetted to 60 questions.** Oracle
-   ships only the sessions that carry the answer — a median of 24 turns per
-   question, which is nearly all needle. Retrieval is correspondingly easy: the
-   `s` split surrounds those same questions with distractors at a median of 501
-   turns each. Absolute scores here are therefore optimistic, and the memory
-   axis separates less than it would at full haystack size. `--variant s -n 20`
-   is the more honest run and costs 7.3x the write path (10,007 turns against
-   1,378), which is the whole reason the default is not already that.
-6. **Prices are hardcoded** in `llm.py` from a June 2026 snapshot and drift.
-7. **The hop cap is a free parameter, and it moves the result.** Four is a
+5. **The two corpora are easy and deep respectively, and neither is both.**
+   LongMemEval's `oracle` split ships only evidence-bearing sessions — a median
+   of 24 turns per question, nearly all needle — so retrieval scores there are
+   optimistic and the memory axis barely separates. LoCoMo fixes the density
+   (369–689 turns per conversation) but is only 10 conversations, so it is deep
+   and narrow where LongMemEval is broad and shallow. Quote which corpus a
+   number came from; they are not interchangeable.
+6. **`aggregation` has no data at all.** Neither corpus has an equivalent
+   category, and no benchmark surveyed covers counting across many turns in a
+   *conversational* setting — RULER has aggregation tasks but is synthetic
+   long-context, testing an attention window rather than a memory store. The
+   probe type stays in the harness because it is a real thing memory should do;
+   the column is simply empty, which is more honest than filling it with
+   relabelled multi-hop questions.
+7. **Prices are hardcoded** in `llm.py` from a June 2026 snapshot and drift.
+8. **The hop cap is a free parameter, and it moves the result.** Four is a
    guess. `loop` and `graph` are both bounded by it, so the comparison between
    them is fair at any setting, but neither number means much in isolation —
    quote `--max-hops` alongside any orchestration figure. The orchestration
@@ -439,13 +463,13 @@ judge call is spent. Everything else goes to a rubric judge.
    column is large the row is a measurement of `--max-hops`, not of the
    orchestrator, and it should be re-run with a longer leash before being
    quoted.
-8. **`loop` needs a model that can actually call tools.** The orchestrator sends
+9. **`loop` needs a model that can actually call tools.** The orchestrator sends
    real tool schemas over whichever transport is configured. Claude handles this;
    so do the larger Ollama models. A small local model that ignores the schema
    will answer without ever searching, which the report shows as `hops` near
    zero. Check that column before concluding the loop was bad at reasoning — it
    may never have run.
-9. **The graph's `assess` node is a second judge inside the measurement.** It is
+10. **The graph's `assess` node is a second judge inside the measurement.** It is
    the same model deciding whether its own evidence is sufficient, and it can be
    wrong in both directions: stopping early on thin evidence, or burning hops
    chasing a fact the store never held. That is a property of this graph, not of
@@ -458,7 +482,7 @@ judge call is spent. Everything else goes to a rubric judge.
 - [ ] Run N=5 trials per cell — `--trials`, the clustered intervals and pass^k
       have landed, but the published run is still a single trial
 - [x] Port LongMemEval as a task suite
-- [ ] Port LoCoMo too, for a second corpus at a different needle density
+- [x] Port LoCoMo too, for a second corpus at a different needle density
 - [ ] Semantic entity resolution in `consolidate()`, measured as an ablation
 - [x] A retrieval-quality metric separate from answer accuracy (did the right
       turn make it into context at all?) to separate retrieval failures from
@@ -485,16 +509,19 @@ src/arena/
   report.py       aggregation, intervals, pass^k, markdown table, charts
   backends/       one file per architecture
   longmemeval.py  LongMemEval -> task YAML, and the stratified subsetter
+  locomo.py       LoCoMo -> task YAML: deeper haystacks, and the only
+                  corpus that ships must_not_contain distractors
 tasks/
-  longmemeval/    the corpus — generated, gitignored (see below)
-  handwritten/    two hand-authored conversations, kept as an offline smoke test
+  longmemeval/    breadth — 60 questions, shallow haystacks. Generated, gitignored
+  locomo/         depth — 3 conversations, ~590 turns each. Generated, gitignored
 scripts/
   build_longmemeval.py   fetch + convert + stratify
+  build_locomo.py        the same, along two budget axes
 tests/            offline suite — stub LLM, no network
 ```
 
 ```bash
-uv run pytest -q                                    # 136 tests, no model needed
+uv run pytest -q                                    # 167 tests, no model needed
 uv run pytest --cov=src/arena --cov-report=term-missing
 ```
 

@@ -13,7 +13,6 @@ question needs, and a fact dropped during a rewrite is gone with no audit trail.
 
 from __future__ import annotations
 
-from datetime import date
 
 from ..memory import Memory, budget_chars, register
 from ..types import Event, Recall
@@ -71,7 +70,7 @@ class AgentNotes(Memory):
         self.pending = []
         self.revisions += 1
 
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
+    def recall(self, query: str) -> Recall:
         self._revise()  # flush before answering; unwritten turns are invisible
         return Recall(
             context=f"MEMORY DOCUMENT:\n{self.notes}"[: budget_chars(self.token_budget)],

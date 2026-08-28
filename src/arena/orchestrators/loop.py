@@ -17,7 +17,6 @@ orchestrator and an unbounded bill.
 
 from __future__ import annotations
 
-from datetime import date
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
@@ -48,8 +47,8 @@ class LoopAgent(Orchestrator):
 
     blurb = "LangChain create_agent -- the model decides when to search again."
 
-    def run(self, store: Memory, question: str, as_of: date | None = None) -> Attempt:
-        retriever = Retriever(store, as_of)
+    def run(self, store: Memory, question: str) -> Attempt:
+        retriever = Retriever(store)
         refused = False  # did the model ask for a search it could not have?
 
         def recall(query: str) -> str:

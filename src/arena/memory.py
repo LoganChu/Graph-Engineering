@@ -17,7 +17,6 @@ do not reorganize simply inherit the no-op.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import date
 from typing import Callable
 
 from .llm import LLM
@@ -63,12 +62,8 @@ class Memory(ABC):
         """Ingest one turn. May call the LLM (tag those calls phase='write')."""
 
     @abstractmethod
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
-        """Return the context to put in front of the agent for this question.
-
-        `as_of` is set only for temporal probes. Backends without a notion of
-        time should ignore it -- and will be scored on that.
-        """
+    def recall(self, query: str) -> Recall:
+        """Return the context to put in front of the agent for this question."""
 
     def consolidate(self) -> None:
         """Optional periodic reorganization. Default: nothing."""

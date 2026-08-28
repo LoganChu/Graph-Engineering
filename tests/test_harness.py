@@ -14,18 +14,27 @@ from arena.types import Probe, Usage
 
 from .conftest import StubLLM
 
-# The hand-authored pair. The default corpus is now LongMemEval, generated into
-# tasks/longmemeval/ and gitignored, so it cannot be what these tests assert on
-# -- and `as_of` only ever appears here, since imported probes carry no date.
-TASK_DIR = Path(__file__).resolve().parents[1] / "tasks" / "handwritten"
+# Both corpora are generated and gitignored, so nothing is *shipped* to assert
+# on. What these tests can still guarantee is that whatever has been built
+# locally loads -- and, offline, that a synthetic task round-trips the loader.
+# Per-corpus conversion is covered in test_longmemeval.py and test_locomo.py.
+CORPORA = [
+    Path(__file__).resolve().parents[1] / "tasks" / name
+    for name in ("longmemeval", "locomo")
+]
 
 
 class TestTaskLoading:
-    def test_every_shipped_task_loads(self) -> None:
-        loaded = tasks.load_all(TASK_DIR)
+    @pytest.mark.parametrize("corpus", CORPORA, ids=lambda p: p.name)
+    def test_a_built_corpus_loads(self, corpus: Path) -> None:
+        """Opportunistic: skips when that corpus has not been built here."""
+        if not corpus.is_dir() or not any(corpus.glob("*.yaml")):
+            pytest.skip(f"{corpus.name} not built -- see scripts/build_{corpus.name}.py")
+        loaded = tasks.load_all(corpus)
         assert loaded, "no task files found"
         for task in loaded:
             assert task.events and task.probes
+            assert all(1 <= p.after_turn <= len(task.events) for p in task.probes)
 
     def test_probe_positions_are_validated(self, tmp_path: Path) -> None:
         bad = tmp_path / "bad.yaml"
@@ -40,10 +49,30 @@ class TestTaskLoading:
         with pytest.raises(ValueError, match="outside"):
             tasks.load_task(bad)
 
-    def test_temporal_probes_parse_as_of(self) -> None:
-        task = tasks.load_task(TASK_DIR / "relocation.yaml")
-        temporal = [p for p in task.probes if p.type == "temporal"]
-        assert temporal and all(p.as_of is not None for p in temporal)
+    def test_a_synthetic_task_round_trips_offline(self, tmp_path: Path) -> None:
+        """The one loader test that needs neither a network nor a built corpus."""
+        path = tmp_path / "t.yaml"
+        path.write_text(
+            """
+id: t
+turns:
+  - {t: 2025-01-01, speaker: user, text: hello, session: s1}
+  - {t: 2025-01-02, speaker: user, text: goodbye, session: s2}
+probes:
+  - after_turn: 2
+    type: negation
+    question: q
+    expected: not stated
+    gold_sessions: [s1]
+    must_not_contain: [Durham]
+""".lstrip(),
+            encoding="utf-8",
+        )
+        task = tasks.load_task(path)
+        assert [e.session_id for e in task.events] == ["s1", "s2"]
+        probe = task.probes[0]
+        assert probe.gold_sessions == ("s1",)
+        assert probe.must_not_contain == ("Durham",)
 
 
 class TestGrading:

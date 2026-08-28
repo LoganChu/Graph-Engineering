@@ -44,7 +44,6 @@ def load_task(path: Path) -> Task:
             type=p["type"],
             question=p["question"],
             expected=str(p["expected"]),
-            as_of=_as_date(p["as_of"]) if p.get("as_of") else None,
             must_not_contain=tuple(p.get("must_not_contain", ())),
             gold_sessions=tuple(str(s) for s in p.get("gold_sessions", ())),
         )

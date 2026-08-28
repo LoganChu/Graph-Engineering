@@ -69,12 +69,16 @@ class TestTemporalGraph:
         assert "chapel hill" in ctx.lower()
         assert "NO LONGER TRUE" in ctx
 
-    def test_as_of_returns_the_value_that_was_true_then(
+    def test_the_retired_value_keeps_its_validity_interval(
         self, store: TemporalGraph
     ) -> None:
-        ctx = store.recall("where do I live", as_of=date(2025, 3, 1)).context
-        assert "durham" in ctx.lower()
-        assert "chapel hill" not in ctx.lower()
+        """The as-of *read* is gone -- no corpus supplies a query timestamp --
+        but the interval it read from is still what supersession records, and
+        it is what the CURRENT / NO LONGER TRUE split is rendered from."""
+        old, new = store.versions[("user", "lives in")]
+        assert (old.valid_from, old.valid_to) == (date(2025, 1, 1), date(2025, 6, 1))
+        assert new.valid_from == date(2025, 6, 1) and new.valid_to is None
+        assert "2025-01-01 to 2025-06-01" in old.render()
 
     def test_multivalued_relations_do_not_supersede(self) -> None:
         s = TemporalGraph(StubLLM())

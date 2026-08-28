@@ -75,7 +75,6 @@ class Probe:
     type: ProbeType
     question: str
     expected: str
-    as_of: date | None = None
     must_not_contain: tuple[str, ...] = ()
     #: Sessions that actually carry the answer. Present for imported corpora
     #: that ship the annotation; empty means retrieval cannot be graded for

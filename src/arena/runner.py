@@ -108,7 +108,7 @@ def run_cell(
 
             for probe in probes_by_turn.get(event.turn_id, []):
                 attempt = _guard(
-                    "read", driver.run, store, probe.question, as_of=probe.as_of
+                    "read", driver.run, store, probe.question
                 )
                 grade, reason, hard_fail = _guard(
                     "judge", judge.grade, llm, probe, attempt.text

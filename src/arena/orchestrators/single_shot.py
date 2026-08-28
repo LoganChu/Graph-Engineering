@@ -7,7 +7,6 @@ remains comparable -- and so the existing response cache still hits.
 
 from __future__ import annotations
 
-from datetime import date
 
 from .. import agent
 from ..memory import Memory
@@ -21,8 +20,8 @@ class SingleShot(Orchestrator):
 
     blurb = "Control. One recall, one answer -- the model never gets a second look."
 
-    def run(self, store: Memory, question: str, as_of: date | None = None) -> Attempt:
-        retriever = Retriever(store, as_of)
+    def run(self, store: Memory, question: str) -> Attempt:
+        retriever = Retriever(store)
         recall = retriever.fetch(question)
         return retriever.finish(
             agent.answer(self.llm, recall, question), note=recall.note

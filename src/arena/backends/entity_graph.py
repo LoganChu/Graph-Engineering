@@ -15,7 +15,6 @@ aliases; the residual error is real and shows up in the multi-hop scores.
 from __future__ import annotations
 
 import re
-from datetime import date
 
 import networkx as nx
 from pydantic import BaseModel, Field
@@ -158,7 +157,7 @@ class EntityGraph(Memory):
             lines.append(f"- ({data['at'].isoformat()}) {s} --[{data['relation']}]--> {o}")
         return "\n".join(lines[: self.MAX_EDGES])
 
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
+    def recall(self, query: str) -> Recall:
         if self.g.number_of_edges() == 0:
             return Recall(context="(no memories)", note="empty graph")
         edges = self._neighborhood(self._seeds(query))

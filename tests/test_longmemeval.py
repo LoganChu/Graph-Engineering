@@ -82,9 +82,6 @@ class TestToTask:
     def test_no_guard_is_invented(self):
         assert "must_not_contain" not in to_task(instance())["probes"][0]
 
-    def test_no_as_of_is_invented(self):
-        assert "as_of" not in to_task(instance())["probes"][0]
-
     def test_mismatched_dates_and_sessions_are_rejected(self):
         with pytest.raises(ValueError):
             to_task(instance(haystack_dates=["2023/05/20 (Sat) 02:21"]))
@@ -104,7 +101,6 @@ class TestToTask:
         assert [e.text for e in loaded.events] == ["earlier turn", "later turn"]
         assert loaded.events[0].at == date(2023, 1, 3)
         assert loaded.probes[0].type == "simple_recall"
-        assert loaded.probes[0].as_of is None
         assert loaded.probes[0].must_not_contain == ()
 
 

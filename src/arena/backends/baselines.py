@@ -7,7 +7,6 @@ architecture that cannot beat it on accuracy is only worth its cost savings.
 
 from __future__ import annotations
 
-from datetime import date
 
 from ..memory import Memory, budget_chars, register
 from ..types import Event, Recall
@@ -40,7 +39,7 @@ class FullTranscript(Memory):
     def observe(self, event: Event) -> None:
         self.events.append(event)
 
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
+    def recall(self, query: str) -> Recall:
         body = "\n".join(e.render() for e in self.events)
         return Recall(
             context=body,
@@ -85,7 +84,7 @@ class WindowSummary(Memory):
         self.pending = []
         self.folds += 1
 
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
+    def recall(self, query: str) -> Recall:
         if self.pending:
             self._fold()
         recent = "\n".join(e.render() for e in self.recent)

@@ -7,7 +7,6 @@ write path stays free and the comparison against BM25 isolates *semantics* from
 
 from __future__ import annotations
 
-from datetime import date
 
 from ..memory import Memory, register
 from ..types import Event, Recall
@@ -51,7 +50,7 @@ class VectorStore(Memory):
         self.events.append(event)
         self.vectors = vec if self.vectors is None else np.vstack([self.vectors, vec])
 
-    def recall(self, query: str, as_of: date | None = None) -> Recall:
+    def recall(self, query: str) -> Recall:
         if not self.events:
             return Recall(context="(no memories)", note="empty")
         model = _load_model()
