@@ -108,10 +108,12 @@ class LLM:
         judge_model: str | None = None,
         judge_provider: Provider | str | None = None,
         judge_base_url: str | None = None,
+        trial: int = 0,
     ) -> None:
         self.model = model
         self.judge_model = judge_model or model
         self.effort = effort
+        self.trial = trial
         self.provider = build(provider, base_url) if isinstance(provider, str) else provider
         if judge_provider is None:
             self.judge_provider = self.provider
@@ -134,7 +136,21 @@ class LLM:
 
     # -- cache ---------------------------------------------------------------
 
-    def _key(self, payload: dict) -> str:
+    def _key(self, payload: dict, phase: Phase = "answer") -> str:
+        """Content address for one call.
+
+        Repeat trials have to miss the cache or they replay trial 0 byte for
+        byte and every error bar collapses to zero. Two deliberate exceptions:
+
+          * trial 0 is never salted, so every response cached before trials
+            existed still hits and the published single-trial numbers reproduce
+            for free;
+          * the judge is never salted. Grading the same answer twice should give
+            the same grade -- judge variance is a separate measurement, and
+            paying for it on every trial is not the same as measuring it.
+        """
+        if self.trial and phase != "judge":
+            payload = {**payload, "trial": self.trial}
         blob = json.dumps(payload, sort_keys=True, default=str).encode()
         return hashlib.sha256(blob).hexdigest()[:32]
 
@@ -185,7 +201,8 @@ class LLM:
                 "system": system,
                 "prompt": prompt,
                 "max_tokens": max_tokens,
-            }
+            },
+            phase,
         )
         hit = self._load(key)
         if hit is not None:
@@ -243,8 +260,9 @@ class LLM:
         `orchestrate`) or prose (the answer, billed `answer`). Deciding after
         the fact means a loop and a graph are measured by the same rule.
         """
-        model = self.model_for(phase if isinstance(phase, str) else "answer")
-        provider = self.provider_for(phase if isinstance(phase, str) else "answer")
+        routing: Phase = phase if isinstance(phase, str) else "answer"
+        model = self.model_for(routing)
+        provider = self.provider_for(routing)
         key = self._key(
             {
                 "kind": "chat",
@@ -255,7 +273,8 @@ class LLM:
                 "messages": messages,
                 "tools": tools,
                 "max_tokens": max_tokens,
-            }
+            },
+            routing,
         )
 
         hit = self._load(key)
@@ -342,7 +361,8 @@ class LLM:
                 "prompt": prompt,
                 "schema": schema.model_json_schema(),
                 "max_tokens": max_tokens,
-            }
+            },
+            phase,
         )
         hit = self._load(key)
         if hit is not None:
@@ -417,7 +437,7 @@ class ModelConfig:
         """Whether any spend on this config translates into money."""
         return PRICES.get(self.model) is not None
 
-    def build(self, ledger: Ledger, cache_dir: Path) -> LLM:
+    def build(self, ledger: Ledger, cache_dir: Path, trial: int = 0) -> LLM:
         return LLM(
             model=self.model,
             judge_model=self.judge_model,
@@ -428,4 +448,5 @@ class ModelConfig:
             base_url=self.base_url,
             cache_dir=cache_dir,
             ledger=ledger,
+            trial=trial,
         )

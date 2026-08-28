@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from .. import agent
 from ..memory import Memory
 from ..orchestration import Orchestrator, Retriever, register
-from ..types import Attempt, Recall
+from ..types import Attempt, Recall, Stop
 
 
 class Assessment(BaseModel):
@@ -93,6 +93,7 @@ class State(TypedDict):
     queries: list[str]
     hops: int
     exhausted: bool
+    stop: Stop
     answer: str
 
 
@@ -117,7 +118,7 @@ class GraphAgent(Orchestrator):
 
         def assess(state: State) -> dict:
             if state["hops"] >= self.max_hops:
-                return {"exhausted": True}
+                return {"exhausted": True, "stop": "hop_cap"}
             verdict = self.llm.parse(
                 ASSESS.format(
                     question=state["question"],
@@ -128,8 +129,14 @@ class GraphAgent(Orchestrator):
                 phase="orchestrate",
                 max_tokens=400,
             )
-            if verdict.sufficient or not verdict.next_query.strip():
-                return {"exhausted": True}
+            if verdict.sufficient:
+                return {"exhausted": True, "stop": "sufficient"}
+            if not verdict.next_query.strip():
+                # It judged the evidence insufficient and then could not say
+                # what to look for. Recorded separately because it is a failure
+                # of the assessor, not of the hop budget -- and the two used to
+                # land in the same bucket.
+                return {"exhausted": True, "stop": "no_query"}
             return {"query": verdict.next_query.strip(), "exhausted": False}
 
         def answer(state: State) -> dict:
@@ -162,9 +169,10 @@ class GraphAgent(Orchestrator):
                 "queries": [],
                 "hops": 0,
                 "exhausted": False,
+                "stop": "answered",  # always overwritten: assess runs first
                 "answer": "",
             },
             # Every cycle is retrieve + assess; +2 covers the answer node and END.
             {"recursion_limit": 2 * self.max_hops + 2},
         )
-        return retriever.finish(final["answer"])
+        return retriever.finish(final["answer"], stop=final["stop"])

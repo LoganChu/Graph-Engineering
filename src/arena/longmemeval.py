@@ -22,6 +22,17 @@ over the `s` variant and the variant choice is really a budget choice:
 it. `stratified()` exists so that subsetting does not quietly skew the probe-type
 mix that the report buckets by.
 
+One thing the dataset gives us that the hand-authored tasks never could:
+`answer_session_ids`, the sessions that actually carry the answer. Those ride
+through onto `Probe.gold_sessions`, and each turn keeps its `session` id, which
+lets `evidence.py` grade *retrieval* against ground truth with no model in the
+loop. It is the only metric here that does not move when the judge changes, and
+it separates the two failures the answer score cannot: the store never found the
+evidence, versus the store found it and the agent fumbled it.
+
+Task files built before this existed still load -- they simply carry no session
+ids and score `None` for evidence. Re-run the builder to pick it up.
+
 Two things the dataset cannot give us, both harness features that go unused:
 
   * `must_not_contain`. Our hard-fail guard needs a distractor string, and
@@ -111,11 +122,19 @@ def to_task(instance: dict[str, Any]) -> dict[str, Any]:
                     "t": dates[i],
                     "speaker": turn.get("role", "user"),
                     "text": turn["content"],
+                    # Carried through so retrieval can be graded against
+                    # `answer_session_ids` without a model in the loop.
+                    "session": ids[i],
                 }
             )
 
     kind = probe_type(instance)
     n_evidence = sum(1 for i in order if ids[i] in evidence)
+    # Only sessions actually present in this haystack are gradeable. Asking a
+    # store to retrieve a session it was never shown would score retrieval
+    # against something no backend could ever satisfy.
+    present = set(ids)
+    gold = sorted(s for s in evidence if s in present and s)
 
     return {
         "id": instance["question_id"],
@@ -136,6 +155,7 @@ def to_task(instance: dict[str, Any]) -> dict[str, Any]:
                 "question": instance["question"],
                 # `answer` is an int on 32 of the 500 instances.
                 "expected": str(instance["answer"]),
+                "gold_sessions": gold,
             }
         ],
     }

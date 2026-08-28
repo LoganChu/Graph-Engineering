@@ -17,6 +17,11 @@ from __future__ import annotations
 from .llm import LLM
 from .types import Probe, Verdict
 
+#: Partial credit, shared with the report so both sides of the harness agree on
+#: what a grade is worth. `PassK` deliberately ignores this and counts only
+#: `correct` -- reliability is a stricter question than accuracy.
+POINTS: dict[str, float] = {"correct": 1.0, "partial": 0.5, "incorrect": 0.0}
+
 RUBRIC = """\
 Grade an assistant's answer to a memory-recall question.
 
@@ -62,8 +67,7 @@ def score(grades: list[str]) -> float:
     """Partial credit: correct = 1.0, partial = 0.5, incorrect = 0."""
     if not grades:
         return 0.0
-    points = {"correct": 1.0, "partial": 0.5, "incorrect": 0.0}
-    return sum(points.get(g, 0.0) for g in grades) / len(grades)
+    return sum(POINTS.get(g, 0.0) for g in grades) / len(grades)
 
 
 def calibrate(llm: LLM, labeled: list[tuple[Probe, str, str]]) -> dict:

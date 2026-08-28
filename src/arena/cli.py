@@ -195,17 +195,25 @@ def cmd_run(args: argparse.Namespace) -> int:
             console.print(f"[red]{exc.args[0]}[/red]")
             return 1
 
+    trials = max(args.trials, 1)
     total_probes = (
         len(backend_names)
         * len(orchestrator_names)
+        * trials
         * sum(len(t.probes) for t in task_list)
     )
     console.print(
         f"[bold]{len(backend_names)} backends x {len(orchestrator_names)} "
-        f"orchestrators x {len(task_list)} tasks[/bold] "
-        f"= {total_probes} probes | {config.provider}:{config.model}"
+        f"orchestrators x {len(task_list)} tasks"
+        + (f" x {trials} trials" if trials > 1 else "")
+        + f"[/bold] = {total_probes} probes | {config.provider}:{config.model}"
         + (f" | judge {config.judge_model}" if config.judge_model else "")
     )
+    if trials == 1:
+        console.print(
+            "[dim]Single trial: scores will print without a usable interval. "
+            "Use --trials 3 to get error bars and pass^k.[/dim]"
+        )
     if config.judge_model in (None, config.model) and not config.priced:
         console.print(
             "[yellow]The judge is the same local model as the agent. Scores will "
@@ -216,14 +224,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         from .judge import score as _score
 
         label = f"{cell.backend} / {cell.orchestrator} / {cell.task_id}"
-        if cell.error:
-            console.print(f"  [red]{label}: failed[/red]")
-            console.print(cell.error)
+        if cell.failure is not None:
+            f = cell.failure
+            turn = f" at turn {f.turn_id}" if f.turn_id else ""
+            console.print(
+                f"  [red]{label}: {cell.outcome} -- {f.where} phase{turn}, "
+                f"{f.probes_done}/{f.probes_expected} probes graded. "
+                f"Excluded from the report.[/red]"
+            )
+            console.print(f.detail)
             return
         hops = sum(p.hops for p in cell.probes) / max(len(cell.probes), 1)
+        trial = f" t{cell.trial}" if cell.trial else ""
         console.print(
             f"  [green]{cell.backend:<16}[/green] {cell.orchestrator:<12} "
-            f"{cell.task_id:<12} score={_score([p.grade for p in cell.probes]):.2f}  "
+            f"{cell.task_id:<12}{trial} "
+            f"score={_score([p.grade for p in cell.probes]):.2f}  "
             f"hops={hops:.1f}  ({cell.wall_s:.1f}s)"
         )
 
@@ -232,6 +248,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         task_list,
         config=config,
         orchestrators=orchestrator_names,
+        trials=trials,
         token_budget=args.token_budget,
         max_hops=args.max_hops,
         cache_dir=Path(args.cache),
@@ -284,6 +301,16 @@ def cmd_inspect(args: argparse.Namespace) -> int:
             queries = probe.get("queries") or []
             if len(queries) > 1 or (queries and queries[0] != probe["question"]):
                 console.print(f"   searched: {' -> '.join(repr(q) for q in queries)}")
+            # Retrieval recall separates the two failures the answer cannot:
+            # recall 1.0 means the evidence was in front of the model and it
+            # still got this wrong.
+            ev = probe.get("evidence")
+            if ev:
+                console.print(
+                    f"   evidence: recall={ev['recall']:.2f} "
+                    f"({ev['n_hit']}/{ev['n_gold']} gold sessions), "
+                    f"stopped={probe.get('stop', '?')}"
+                )
             console.print(f"   [dim]{probe['reason']}[/dim]")
             console.print()
     return 0
@@ -348,6 +375,14 @@ def main(argv: list[str] | None = None) -> int:
         "`uv sync --extra orchestration`",
     )
     add_model_flags(p_run)
+    p_run.add_argument(
+        "--trials",
+        type=int,
+        default=1,
+        help="repeat the whole matrix N times. Anything above 1 buys error "
+        "bars and pass^k; it also multiplies the bill, since trials past the "
+        "first deliberately miss the response cache",
+    )
     p_run.add_argument("--token-budget", type=int, default=2000)
     p_run.add_argument(
         "--max-hops",

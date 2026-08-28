@@ -21,10 +21,11 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from .judge import score
+from . import evidence as _evidence
+from .judge import POINTS, score
 from .llm import cost_usd
 from .memory import get_backend
-from .types import RunResult
+from .types import RunResult, Stat
 
 PROBE_ORDER = [
     "simple_recall",
@@ -40,21 +41,84 @@ PROBE_ORDER = [
 BASELINE_ORCHESTRATOR = "single_shot"
 
 
+def blurb_for(backend: str) -> str:
+    """A cell can now carry a backend name the registry never resolved.
+
+    Setup failures are recorded rather than raised, so the summary has to be
+    able to describe a cell that never got a store built -- looking the name up
+    unguarded here would turn a recorded failure back into a crash.
+    """
+    try:
+        return getattr(get_backend(backend), "blurb", "")
+    except KeyError:
+        return ""
+
+
 def cell_key(backend: str, orchestrator: str) -> str:
     if orchestrator == BASELINE_ORCHESTRATOR:
         return backend
     return f"{backend}/{orchestrator}"
 
 
+def score_stat(probes: list) -> Stat:
+    """Mean score with a cluster-robust standard error.
+
+    Probes are averaged across trials first, then within their task, and the
+    spread is taken over tasks. Clustering by task is the correct unit because
+    probes sharing a haystack are not independent observations of it.
+
+    On the LongMemEval corpus this is a distinction without a difference --
+    `to_task` emits exactly one probe per task, so tasks and probes coincide --
+    but the hand-authored tasks carry several probes each, and pooling those as
+    independent would understate the interval on precisely the runs that have
+    the least data.
+    """
+    by_probe: dict[str, list[float]] = defaultdict(list)
+    task_of: dict[str, str] = {}
+    for p in probes:
+        by_probe[p.probe.probe_id].append(POINTS.get(p.grade, 0.0))
+        task_of[p.probe.probe_id] = p.task_id
+
+    by_task: dict[str, list[float]] = defaultdict(list)
+    for probe_id, values in by_probe.items():
+        by_task[task_of[probe_id]].append(sum(values) / len(values))
+
+    return Stat.over([sum(v) / len(v) for v in by_task.values()])
+
+
+def pass_k(probes: list, k: int) -> tuple[float, int]:
+    """Share of probes graded `correct` on every one of k trials.
+
+    Only probes present in all k trials count, so a run interrupted midway
+    reports pass^k over what it actually completed rather than punishing probes
+    it never got to.
+    """
+    by_probe: dict[str, list[bool]] = defaultdict(list)
+    for p in probes:
+        by_probe[p.probe.probe_id].append(p.correct)
+    full = [v for v in by_probe.values() if len(v) == k]
+    if not full:
+        return 0.0, 0
+    return sum(1 for v in full if all(v)) / len(full), len(full)
+
+
 def summarize(results: list[RunResult]) -> dict:
-    """Collapse the raw cells into per-(backend, orchestrator) metrics."""
+    """Collapse the raw cells into per-(backend, orchestrator) metrics.
+
+    Cells that did not finish are excluded from every score and counted
+    separately. Including them was silently generous: a replay that crashed
+    before the hard probes fired contributed only the easy ones it had already
+    answered, and the cell read as a good result.
+    """
     grouped: dict[tuple[str, str], list[RunResult]] = defaultdict(list)
     for r in results:
         grouped[(r.backend, r.orchestrator)].append(r)
 
     summary: dict[str, dict] = {}
     for (backend, orchestrator), cells in grouped.items():
-        probes = [p for c in cells for p in c.probes]
+        done = [c for c in cells if c.outcome == "complete"]
+        broken = [c for c in cells if c.outcome != "complete"]
+        probes = [p for c in done for p in c.probes]
         grades = [p.grade for p in probes]
 
         per_type: dict[str, float] = {}
@@ -65,8 +129,18 @@ def summarize(results: list[RunResult]) -> dict:
                 per_type[ptype] = score(subset)
                 counts[ptype] = len(subset)
 
-        usage = [u for c in cells for u in c.usage]
+        # Spend is counted over finished cells so that $/probe has a coherent
+        # denominator; what the broken ones burned is reported on its own.
+        usage = [u for c in done for u in c.usage]
+        wasted = sum(cost_usd(u) for c in broken for u in c.usage)
         n_probes = len(probes) or 1
+        stat = score_stat(probes)
+        k = len({c.trial for c in done})
+        strict = sum(1 for p in probes if p.correct) / n_probes
+        graded_evidence = [p.evidence for p in probes if p.evidence is not None]
+        stops: dict[str, int] = defaultdict(int)
+        for p in probes:
+            stops[p.stop] += 1
 
         def spend(*phases: str) -> tuple[float, int]:
             picked = [u for u in usage if u.phase in phases]
@@ -84,14 +158,41 @@ def summarize(results: list[RunResult]) -> dict:
         orch_cost, orch_tokens = spend("orchestrate")
         judge_cost, judge_tokens = spend("judge")
 
-        summary[cell_key(backend, orchestrator)] = {
+        metrics = {
             "backend": backend,
             "orchestrator": orchestrator,
-            "blurb": getattr(get_backend(backend), "blurb", ""),
-            "score": score(grades),
+            "blurb": blurb_for(backend),
+            # Kept a bare float so charts and sorting stay simple; the interval
+            # lives beside it rather than replacing it.
+            "score": stat.mean,
+            "score_stderr": stat.stderr,
+            "score_ci95": stat.ci95,
+            "score_clusters": stat.n,
+            # Strict accuracy ignores partial credit. Reported next to pass^k
+            # because the gap between them is the reliability story: the same
+            # store answering 75% of probes right answers 42% right three
+            # times running.
+            "strict_accuracy": strict,
+            "trials": k,
             "by_type": per_type,
             "type_counts": counts,
             "n_probes": len(probes),
+            "n_cells": len(cells),
+            "n_incomplete": len(broken),
+            "incomplete": [
+                {
+                    "task": c.task_id,
+                    "trial": c.trial,
+                    "outcome": c.outcome,
+                    "where": c.failure.where if c.failure else None,
+                    "turn_id": c.failure.turn_id if c.failure else None,
+                    "probes_done": c.failure.probes_done if c.failure else 0,
+                    "probes_expected": c.failure.probes_expected if c.failure else 0,
+                }
+                for c in broken
+            ],
+            "wasted_cost_usd": wasted,
+            "stops": dict(stops),
             "hard_fails": sum(1 for p in probes if p.hard_fail),
             "write_cost_usd": write_cost,
             "read_cost_usd": read_cost,
@@ -117,8 +218,18 @@ def summarize(results: list[RunResult]) -> dict:
             ),
             "wall_s": sum(c.wall_s for c in cells),
             "errors": [c.error for c in cells if c.error],
-            "store_stats": {c.task_id: c.store_stats for c in cells},
+            "store_stats": {c.task_id: c.store_stats for c in done},
         }
+
+        # Retrieval quality, present only when the corpus ships gold evidence
+        # and the backend reports traceable provenance.
+        metrics.update(_evidence.aggregate(graded_evidence))
+        if k > 1:
+            value, n = pass_k(probes, k)
+            metrics["pass_k"] = value
+            metrics["pass_k_n"] = n
+
+        summary[cell_key(backend, orchestrator)] = metrics
     return summary
 
 
@@ -127,6 +238,104 @@ def orchestrators_in(summary: dict) -> list[str]:
     found = {m.get("orchestrator", BASELINE_ORCHESTRATOR) for m in summary.values()}
     head = [BASELINE_ORCHESTRATOR] if BASELINE_ORCHESTRATOR in found else []
     return head + sorted(found - {BASELINE_ORCHESTRATOR})
+
+
+def score_cell(m: dict) -> str:
+    """A score is never rendered without saying how well it is known.
+
+    A single cluster carries no spread, so it prints `?` rather than a
+    reassuring `+/-0.00`.
+    """
+    if m.get("score_clusters", 0) < 2:
+        return f"{m['score']:.2f} +/-?"
+    return f"{m['score']:.2f} +/-{m['score_ci95']:.2f}"
+
+
+def reliability_table(summary: dict) -> list[str]:
+    """Mean accuracy against pass^k. Rendered only when trials were repeated."""
+    rows = [(n, m) for n, m in summary.items() if "pass_k" in m]
+    if not rows:
+        return []
+    k = max(m["trials"] for _, m in rows)
+    lines = [
+        "",
+        f"### Reliability over {k} trials",
+        "",
+        f"| Backend | Strict accuracy | pass^{k} | Probes |",
+        "|---" * 4 + "|",
+    ]
+    for name, m in sorted(rows, key=lambda kv: kv[1]["pass_k"], reverse=True):
+        lines.append(
+            f"| `{name}` | {m['strict_accuracy']:.2f} | {m['pass_k']:.2f} | "
+            f"{m['pass_k_n']} |"
+        )
+    lines += [
+        "",
+        "_Strict accuracy counts a probe each time it was answered correctly; "
+        "pass^k counts it only if every trial got it. The gap between the two "
+        "columns is how much of the headline score is luck._",
+    ]
+    return lines
+
+
+def evidence_table(summary: dict) -> list[str]:
+    """Retrieval graded against the corpus's gold annotation, no judge involved."""
+    rows = [(n, m) for n, m in summary.items() if m.get("evidence_n")]
+    if not rows:
+        return []
+    lines = [
+        "",
+        "### Retrieval quality (graded against gold evidence)",
+        "",
+        "| Backend | Evidence recall | Precision | Efficiency | Probes graded |",
+        "|---" * 5 + "|",
+    ]
+    for name, m in sorted(rows, key=lambda kv: kv[1]["evidence_recall"], reverse=True):
+        lines.append(
+            f"| `{name}` | {m['evidence_recall']:.2f} | "
+            f"{m['evidence_precision']:.2f} | {m['evidence_efficiency']:.2f} | "
+            f"{m['evidence_n']} |"
+        )
+    missing = sorted(n for n, m in summary.items() if not m.get("evidence_n"))
+    lines += [
+        "",
+        "_The only numbers here that do not move when the judge model changes. "
+        "A low score with high recall means the store found the evidence and "
+        "the agent fumbled it; a low score with low recall is a memory "
+        "failure._",
+    ]
+    if missing:
+        lines += [
+            "",
+            "_Not graded: "
+            + ", ".join(f"`{n}`" for n in missing)
+            + ". A backend that answers from text it rewrote has no turn to "
+            "trace back to -- its evidence is unauditable by construction._",
+        ]
+    return lines
+
+
+def incomplete_note(summary: dict) -> list[str]:
+    """Say what was dropped. A silent exclusion is as misleading as a silent include."""
+    dropped = [(n, m) for n, m in summary.items() if m.get("n_incomplete")]
+    if not dropped:
+        return []
+    lines = ["", "### Cells excluded", ""]
+    for name, m in sorted(dropped):
+        for cell in m["incomplete"]:
+            where = cell["where"] or "?"
+            turn = f" at turn {cell['turn_id']}" if cell["turn_id"] else ""
+            lines.append(
+                f"- `{name}` / `{cell['task']}` trial {cell['trial']}: "
+                f"{cell['outcome']} in the {where} phase{turn} "
+                f"({cell['probes_done']}/{cell['probes_expected']} probes graded)"
+            )
+    waste = sum(m.get("wasted_cost_usd", 0.0) for _, m in dropped)
+    lines += [
+        "",
+        f"_Excluded from every score above. ${waste:.4f} was spent on them._",
+    ]
+    return lines
 
 
 def to_markdown(summary: dict, priced: bool = True) -> str:
@@ -148,9 +357,13 @@ def to_markdown(summary: dict, priced: bool = True) -> str:
     lines = [head, "|---" * 7 + "|"]
     for name, m in rows:
         lines.append(
-            f"| `{name}` | {m['score']:.2f} | {fmt(m)} | "
+            f"| `{name}` | {score_cell(m)} | {fmt(m)} | "
             f"{m['avg_context_chars']:.0f} | {m['hard_fails']} |"
         )
+
+    lines += reliability_table(summary)
+    lines += evidence_table(summary)
+    lines += incomplete_note(summary)
 
     lines += ["", "### Score by probe type", ""]
     types = [t for t in PROBE_ORDER if any(t in m["by_type"] for _, m in rows)]
@@ -203,8 +416,9 @@ def orchestration_table(summary: dict, priced: bool = True) -> list[str]:
         "",
         "### Orchestration: does searching again pay for itself?",
         "",
-        f"| Backend | Orchestrator | Score | Score lift | Hops | {unit} | {unit} lift |",
-        "|---" * 7 + "|",
+        f"| Backend | Orchestrator | Score | Score lift | Hops | Capped | "
+        f"{unit} | {unit} lift |",
+        "|---" * 8 + "|",
     ]
     for backend in sorted(by_backend):
         control = by_backend[backend].get(BASELINE_ORCHESTRATOR)
@@ -218,8 +432,9 @@ def orchestration_table(summary: dict, priced: bool = True) -> list[str]:
                 d_score = f"{m['score'] - control['score']:+.2f}"
                 d_cost = delta(cost_of(m) - cost_of(control))
             lines.append(
-                f"| `{backend}` | `{orchestrator}` | {m['score']:.2f} | {d_score} | "
-                f"{m['avg_hops']:.1f} | {render(cost_of(m))} | {d_cost} |"
+                f"| `{backend}` | `{orchestrator}` | {score_cell(m)} | {d_score} | "
+                f"{m['avg_hops']:.1f} | {capped_share(m)} | "
+                f"{render(cost_of(m))} | {d_cost} |"
             )
 
     lines += [
@@ -227,8 +442,23 @@ def orchestration_table(summary: dict, priced: bool = True) -> list[str]:
         "_Hops are store round trips per probe. A `+0.00` score delta beside a "
         "positive cost delta is the result worth reporting: the extra "
         "orchestration bought nothing._",
+        "",
+        "_`Capped` is the share of probes that stopped because the hop budget "
+        "ran out rather than because the policy was satisfied. When it is "
+        "large, the row is a measurement of `--max-hops` and not of the "
+        "orchestrator._",
     ]
     return lines
+
+
+def capped_share(m: dict) -> str:
+    """Share of probes that ran out of budget rather than deciding they were done."""
+    stops = m.get("stops") or {}
+    total = sum(stops.values())
+    if not total:
+        return "--"
+    out = stops.get("hop_cap", 0) + stops.get("recursion_limit", 0)
+    return f"{out / total:.0%}"
 
 
 def write_charts(summary: dict, out_dir: Path, priced: bool = True) -> list[Path]:
@@ -372,8 +602,20 @@ def save(results: list[RunResult], summary: dict, out_dir: Path) -> None:
             "backend": r.backend,
             "orchestrator": r.orchestrator,
             "task": r.task_id,
+            "trial": r.trial,
             "wall_s": r.wall_s,
+            "outcome": r.outcome,
             "error": r.error,
+            "failure": (
+                {
+                    "where": r.failure.where,
+                    "turn_id": r.failure.turn_id,
+                    "probes_done": r.failure.probes_done,
+                    "probes_expected": r.failure.probes_expected,
+                }
+                if r.failure
+                else None
+            ),
             "store_stats": r.store_stats,
             "probes": [
                 {
@@ -387,6 +629,23 @@ def save(results: list[RunResult], summary: dict, out_dir: Path) -> None:
                     "hard_fail": p.hard_fail,
                     "context_chars": p.context_chars,
                     "hops": p.hops,
+                    "trial": p.trial,
+                    # Why it stopped searching, and how well it retrieved.
+                    # Both are error-analysis payload: four hops ending in
+                    # `hop_cap` with zero evidence recall is a different bug
+                    # from one hop ending in `sufficient` with recall 1.0.
+                    "stop": p.stop,
+                    "evidence": (
+                        {
+                            "recall": p.evidence.recall,
+                            "precision": p.evidence.precision,
+                            "efficiency": p.evidence.efficiency,
+                            "n_gold": p.evidence.n_gold,
+                            "n_hit": p.evidence.n_hit,
+                        }
+                        if p.evidence
+                        else None
+                    ),
                     # What the orchestrator actually searched for. This is the
                     # error-analysis payload: a wrong answer after four hops of
                     # bad queries is a different bug from one after a good query.

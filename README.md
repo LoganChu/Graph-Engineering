@@ -239,11 +239,61 @@ uv run arena run --provider local --model qwen2.5:7b-instruct
 ```
 
 Outputs land in `results/`: `summary.json`, `runs.json` (every answer with its
-grade and reason), `table.md`, and two charts — score by probe type, and the
-accuracy-vs-cost scatter that shows which backends are actually on the frontier.
+grade, reason, stop reason and retrieval score), `table.md`, and two charts —
+score by probe type, and the accuracy-vs-cost scatter that shows which backends
+are actually on the frontier.
 
 Start with `-b bm25 -b temporal_graph` on a small corpus (`-n 20`) to see the
 shape of the result before committing to the full matrix.
+
+### Error bars, and why the default run has none
+
+```bash
+uv run arena run -b bm25 -b temporal_graph --trials 3
+```
+
+A single trial produces a point estimate and nothing else. At 60 probes a score
+of 0.70 carries a standard error near 0.06 — a 95% interval of ±0.12 — so most
+of the gaps in a one-trial table are inside the noise. `--trials` repeats the
+whole matrix and buys two things a single run cannot have:
+
+- a **confidence interval** on every score, clustered by task, because probes
+  sharing a haystack are not independent observations of it;
+- **pass^k** — the share of probes answered correctly on *every* trial. Mean
+  accuracy and reliability are different questions: a store that is right 75% of
+  the time answers only 42% of probes right three times running.
+
+Trials past the first deliberately miss the response cache, so this multiplies
+the bill. The judge is exempt: the same answer gets the same grade in every
+trial, so grading is never re-paid.
+
+### Retrieval is graded separately from the answer
+
+The answer score confounds two failures. A backend can score badly because it
+never retrieved the evidence, or because it retrieved it and the agent fumbled
+it — and those are different bugs with different fixes.
+
+LongMemEval ships `answer_session_ids`, and every retrieval backend already
+reports which turns it handed over, so the report grades retrieval directly:
+
+| | what it says |
+|---|---|
+| **Evidence recall** | share of gold sessions the store actually surfaced |
+| **Precision** | share of surfaced sessions that were gold |
+| **Efficiency** | share of retrieved material that was worth retrieving |
+
+No model is involved, which makes these the only numbers in the harness that do
+not move when the judge model changes. `agent_notes` and `window_summary` are
+excluded rather than scored: both answer from text they rewrote, so there is no
+turn to trace back to, and the report says so instead of quietly scoring them
+zero.
+
+This needs session ids in the task files. **Corpora built before this landed
+still run — they simply report no retrieval scores.** Rebuild to pick it up:
+
+```bash
+python scripts/build_longmemeval.py
+```
 
 ---
 
@@ -342,8 +392,11 @@ judge call is spent. Everything else goes to a rubric judge.
    agreement against hand-labeled examples. It has not been run yet. Until it
    has, treat differences under ~0.1 as noise. This matters roughly ten times
    more when the judge is a small local model — see the judge problem above.
-2. **No repeated trials.** Every cell runs once. No variance estimate, no
-   confidence intervals, so small gaps are not meaningful.
+2. **The default run is still a single trial.** `--trials` exists and gives you
+   clustered confidence intervals and pass^k, but it is opt-in because it
+   multiplies the bill. A one-trial table prints `+/-?` in the score column and
+   means it: nothing in that run tells you how much of the gap is luck. Do not
+   quote a single-trial number against another single-trial number.
 3. **Entity linking in the graph backends is string-normalized, not semantic.**
    "my sister" and "Rachel" stay separate nodes unless the extractor resolves
    them. This is a real weakness of the implementation and shows up in the
@@ -368,13 +421,24 @@ judge call is spent. Everything else goes to a rubric judge.
    "who owns checkout?" retrieved nothing because "checkout" appears as an
    object. Fixed by routing retrieval through the k-hop walk; locked in by
    `tests/test_graph_retrieval.py`.
-5. **Two hand-written tasks.** Enough to show the method, not enough to rank
-   architectures. LoCoMo and LongMemEval are the real suites to port next.
+5. **The corpus is the `oracle` split, subsetted to 60 questions.** Oracle
+   ships only the sessions that carry the answer — a median of 24 turns per
+   question, which is nearly all needle. Retrieval is correspondingly easy: the
+   `s` split surrounds those same questions with distractors at a median of 501
+   turns each. Absolute scores here are therefore optimistic, and the memory
+   axis separates less than it would at full haystack size. `--variant s -n 20`
+   is the more honest run and costs 7.3x the write path (10,007 turns against
+   1,378), which is the whole reason the default is not already that.
 6. **Prices are hardcoded** in `llm.py` from a June 2026 snapshot and drift.
 7. **The hop cap is a free parameter, and it moves the result.** Four is a
    guess. `loop` and `graph` are both bounded by it, so the comparison between
    them is fair at any setting, but neither number means much in isolation —
-   quote `--max-hops` alongside any orchestration figure.
+   quote `--max-hops` alongside any orchestration figure. The orchestration
+   table now prints a `Capped` column: the share of probes that stopped because
+   the budget ran out rather than because the policy was satisfied. When that
+   column is large the row is a measurement of `--max-hops`, not of the
+   orchestrator, and it should be re-run with a longer leash before being
+   quoted.
 8. **`loop` needs a model that can actually call tools.** The orchestrator sends
    real tool schemas over whichever transport is configured. Claude handles this;
    so do the larger Ollama models. A small local model that ignores the schema
@@ -391,12 +455,14 @@ judge call is spent. Everything else goes to a rubric judge.
 ## Roadmap
 
 - [ ] Run the judge calibration set and publish the agreement number
-- [ ] N=5 trials per cell with error bars
-- [ ] Port LoCoMo / LongMemEval as additional task suites
+- [ ] Run N=5 trials per cell — `--trials`, the clustered intervals and pass^k
+      have landed, but the published run is still a single trial
+- [x] Port LongMemEval as a task suite
+- [ ] Port LoCoMo too, for a second corpus at a different needle density
 - [ ] Semantic entity resolution in `consolidate()`, measured as an ablation
-- [ ] A retrieval-quality metric separate from answer accuracy (did the right
+- [x] A retrieval-quality metric separate from answer accuracy (did the right
       turn make it into context at all?) to separate retrieval failures from
-      reasoning failures
+      reasoning failures — `evidence.py`
 - [ ] Sweep `--max-hops` to find where the orchestration lift saturates
 - [ ] A non-LLM exit condition for `graph` (retrieval score threshold) as an
       ablation against the model-judged one
@@ -410,11 +476,13 @@ src/arena/
   llm.py          caching client, phase-tagged ledger, per-phase model routing
   agent.py        the agent under test — one prompt, shared by all three
   judge.py        deterministic guard + rubric judge + calibration
+  evidence.py     retrieval graded against gold sessions — the one metric with
+                  no model in it
   orchestration.py  the control-flow interface, registry, and hop accounting
   orchestrators/  single_shot (no deps), loop (LangChain), graph (LangGraph),
                   adapter.py — BaseChatModel over the arena's cached client
-  runner.py       the (backend x orchestrator x task) matrix
-  report.py       aggregation, markdown table, charts
+  runner.py       the (backend x orchestrator x task x trial) matrix
+  report.py       aggregation, intervals, pass^k, markdown table, charts
   backends/       one file per architecture
   longmemeval.py  LongMemEval -> task YAML, and the stratified subsetter
 tasks/
@@ -426,7 +494,7 @@ tests/            offline suite — stub LLM, no network
 ```
 
 ```bash
-uv run pytest -q                                    # 75 tests, no model needed
+uv run pytest -q                                    # 136 tests, no model needed
 uv run pytest --cov=src/arena --cov-report=term-missing
 ```
 

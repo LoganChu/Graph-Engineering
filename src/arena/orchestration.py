@@ -33,7 +33,7 @@ from typing import Callable
 
 from .llm import LLM
 from .memory import Memory
-from .types import Attempt, Recall
+from .types import Attempt, Recall, Stop
 
 #: Ceiling on store round trips per probe. Without one, a model that keeps
 #: failing to find a fact will keep paying for the privilege.
@@ -79,6 +79,10 @@ class Retriever:
         self.chars = 0
         self.latency_s = 0.0
         self.queries: list[str] = []
+        # Union across hops, first-seen order. Accumulating it here means
+        # retrieval can be graded against gold evidence without any
+        # orchestrator knowing that gold evidence exists.
+        self.provenance: list[str] = []
 
     def fetch(self, query: str) -> Recall:
         started = time.perf_counter()
@@ -87,15 +91,22 @@ class Retriever:
         self.hops += 1
         self.chars += len(recall.context)
         self.queries.append(query)
+        seen = set(self.provenance)
+        for entry in recall.provenance:
+            if entry not in seen:
+                seen.add(entry)
+                self.provenance.append(entry)
         return recall
 
-    def finish(self, text: str, note: str = "") -> Attempt:
+    def finish(self, text: str, note: str = "", stop: Stop = "answered") -> Attempt:
         return Attempt(
             text=text,
             hops=self.hops,
             context_chars=self.chars,
             read_latency_s=self.latency_s,
             queries=tuple(self.queries),
+            provenance=tuple(self.provenance),
+            stop=stop,
             note=note,
         )
 

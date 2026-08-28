@@ -27,7 +27,7 @@ from langgraph.errors import GraphRecursionError
 from .. import agent
 from ..memory import Memory
 from ..orchestration import Orchestrator, Retriever, register
-from ..types import Attempt
+from ..types import Attempt, Stop
 from .adapter import ArenaChatModel
 
 TOOL_DESCRIPTION = """\
@@ -50,12 +50,15 @@ class LoopAgent(Orchestrator):
 
     def run(self, store: Memory, question: str, as_of: date | None = None) -> Attempt:
         retriever = Retriever(store, as_of)
+        refused = False  # did the model ask for a search it could not have?
 
         def recall(query: str) -> str:
             # The cap is enforced here rather than by the framework so that an
             # over-eager model spends one wasted model call, not one wasted
             # retrieval plus a crash.
+            nonlocal refused
             if retriever.hops >= self.max_hops:
+                refused = True
                 return BUDGET_SPENT
             return retriever.fetch(query).context or "(no matching memory found)"
 
@@ -72,6 +75,7 @@ class LoopAgent(Orchestrator):
         )
 
         note = ""
+        stop: Stop = "answered"
         try:
             # Each hop costs two graph steps (decide, then execute), plus the
             # opening call and the final answer.
@@ -80,13 +84,19 @@ class LoopAgent(Orchestrator):
                 {"recursion_limit": 2 * self.max_hops + 4},
             )
             text = _final_answer(state["messages"])
+            # It answered, but only after being told the budget was gone. That
+            # is a different result from answering while it still had searches
+            # in hand, and the two used to be indistinguishable in the report.
+            if refused:
+                stop = "hop_cap"
         except GraphRecursionError:
             # A loop that will not terminate is a result about loop engineering,
             # not a harness failure. Record it and grade it like any other miss.
             text = "I don't know."
             note = "hit the recursion limit without answering"
+            stop = "recursion_limit"
 
-        return retriever.finish(text, note=note)
+        return retriever.finish(text, note=note, stop=stop)
 
 
 def _final_answer(messages: list) -> str:
