@@ -56,23 +56,69 @@ class TestTaskLoading:
             """
 id: t
 turns:
-  - {t: 2025-01-01, speaker: user, text: hello, session: s1}
-  - {t: 2025-01-02, speaker: user, text: goodbye, session: s2}
+  - {t: 2025-01-01, speaker: user, text: hello, session: s1, ref: "s1:0"}
+  - {t: 2025-01-02, speaker: user, text: goodbye, session: s2, ref: "s2:0"}
 probes:
   - after_turn: 2
     type: negation
     question: q
     expected: not stated
     gold_sessions: [s1]
+    gold_turns: ["s1:0"]
     must_not_contain: [Durham]
 """.lstrip(),
             encoding="utf-8",
         )
         task = tasks.load_task(path)
         assert [e.session_id for e in task.events] == ["s1", "s2"]
+        assert [e.ref for e in task.events] == ["s1:0", "s2:0"]
         probe = task.probes[0]
         assert probe.gold_sessions == ("s1",)
+        assert probe.gold_turns == ("s1:0",)
         assert probe.must_not_contain == ("Durham",)
+
+    def test_gold_turns_naming_nothing_in_the_transcript_are_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """Otherwise the intersection in `evidence.score` quietly grades the
+        probe against whatever survived, reporting a recall that asks less than
+        it claims to."""
+        bad = tmp_path / "bad.yaml"
+        bad.write_text(
+            """
+id: bad
+turns:
+  - {t: 2025-01-01, text: hello, session: s1, ref: "s1:0"}
+probes:
+  - after_turn: 1
+    type: simple_recall
+    question: q
+    expected: a
+    gold_turns: ["s1:7"]
+""".lstrip(),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="not in the transcript"):
+            tasks.load_task(bad)
+
+    def test_a_task_with_no_refs_at_all_still_loads(self, tmp_path: Path) -> None:
+        """Hand-authored files predate all of this and are graded on the answer."""
+        path = tmp_path / "t.yaml"
+        path.write_text(
+            """
+id: t
+turns:
+  - {t: 2025-01-01, text: hello}
+probes:
+  - {after_turn: 1, type: simple_recall, question: q, expected: a}
+""".lstrip(),
+            encoding="utf-8",
+        )
+        task = tasks.load_task(path)
+        assert task.events[0].ref == ""
+        assert task.probes[0].gold_turns == ()
+
+
 
 
 class TestGrading:

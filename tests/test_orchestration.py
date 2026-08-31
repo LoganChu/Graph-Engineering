@@ -7,6 +7,8 @@ is present. The framework-backed orchestrators skip when the extra is missing.
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -17,7 +19,7 @@ from arena.llm import LLM, Ledger, ModelConfig
 from arena.memory import get_backend
 from arena.orchestration import Retriever, available, get_orchestrator
 from arena.providers import AnthropicProvider, Completion, ToolCall
-from arena.types import Event, Probe, Task
+from arena.types import Event, Probe, Recall, Task
 
 from .conftest import StubLLM
 
@@ -93,6 +95,77 @@ class TestSingleShot:
 
         assert llm.ledger.by_phase("orchestrate") == []
         assert llm.ledger.by_phase("answer")
+
+
+class TestFanout:
+    """Breadth without feedback -- the control the iterative rows are read against."""
+
+    def test_the_question_is_searched_verbatim_first(self) -> None:
+        """Its evidence has to be a superset of single_shot's, or the ablation
+        is not measuring only the extra queries."""
+        llm = StubLLM()
+        store = build_store("bm25", llm, EVENTS)
+        attempt = get_orchestrator("fanout")(llm).run(store, "what cat do I have")
+
+        assert attempt.queries[0] == "what cat do I have"
+
+    def test_it_spends_the_whole_budget_in_one_round(self) -> None:
+        llm = StubLLM(rewrites=["the cat", "pet name", "allergies"])
+        store = build_store("bm25", llm, EVENTS)
+        attempt = get_orchestrator("fanout")(llm, max_hops=4).run(store, "cat")
+
+        assert attempt.hops == 4, "the question plus three rewrites"
+        assert attempt.queries == ("cat", "the cat", "pet name", "allergies")
+
+    def test_one_control_flow_call_however_wide_the_fan(self) -> None:
+        """The cost claim: one `orchestrate` call, not one per hop like `graph`."""
+        llm = StubLLM(rewrites=["a", "b", "c", "d", "e"])
+        store = build_store("bm25", llm, EVENTS)
+        get_orchestrator("fanout")(llm, max_hops=6).run(store, "cat")
+
+        assert len(llm.ledger.by_phase("orchestrate")) == 1
+        assert len(llm.ledger.by_phase("answer")) == 1
+
+    def test_a_rewrite_never_costs_more_than_the_budget(self) -> None:
+        llm = StubLLM(rewrites=["a", "b", "c", "d", "e"])
+        store = build_store("bm25", llm, EVENTS)
+        assert get_orchestrator("fanout")(llm, max_hops=2).run(store, "cat").hops == 2
+
+    def test_blank_and_repeated_rewrites_are_dropped(self) -> None:
+        """A rewrite echoing the question would spend a hop on evidence in hand."""
+        llm = StubLLM(rewrites=["  ", "CAT", "cat ", "the cat"])
+        store = build_store("bm25", llm, EVENTS)
+        attempt = get_orchestrator("fanout")(llm, max_hops=4).run(store, "cat")
+
+        assert attempt.queries == ("cat", "the cat")
+
+    def test_a_budget_of_one_pays_for_no_rewrite(self) -> None:
+        """With no room to fan out it must degenerate to single_shot exactly,
+        not to single_shot plus a wasted call."""
+        llm = StubLLM()
+        store = build_store("bm25", llm, EVENTS)
+        attempt = get_orchestrator("fanout")(llm, max_hops=1).run(store, "cat")
+
+        assert attempt.hops == 1
+        assert llm.ledger.by_phase("orchestrate") == []
+
+    def test_every_query_reaches_the_answer(self) -> None:
+        llm = StubLLM(rewrites=["the cat", "pet name"])
+        store = build_store("bm25", llm, EVENTS)
+        get_orchestrator("fanout")(llm, max_hops=3).run(store, "cat")
+
+        answers = [p for phase, p in llm.calls if phase == "answer"]
+        assert len(answers) == 1
+        assert answers[0].count("--- search ") == 3
+
+    def test_a_spent_budget_is_not_reported_as_capped(self) -> None:
+        """`hop_cap` means a policy was cut short. This one had no policy."""
+        llm = StubLLM()
+        store = build_store("bm25", llm, EVENTS)
+        assert get_orchestrator("fanout")(llm).run(store, "cat").stop == "answered"
+
+    def test_it_runs_without_the_orchestration_extra(self) -> None:
+        assert "fanout" in available()
 
 
 class TestChatPlumbing:
@@ -354,12 +427,139 @@ class TestGraph:
         assert answer_prompts[0].count("--- search ") == 2
 
 
+class SlowStore:
+    """A store whose earliest query is its slowest, and which records both the
+    order it finished in and the threads it ran on.
+
+    Exists so the fan-out's ordering guarantee can be tested deterministically
+    instead of by running it repeatedly and hoping the race shows up.
+    """
+
+    name = "slow"
+
+    def __init__(self, n: int, unit: float = 0.05) -> None:
+        self.n = n
+        self.unit = unit
+        self.threads: set[int] = set()
+        self.completed: list[str] = []
+        self._lock = threading.Lock()
+
+    def observe(self, event) -> None:  # pragma: no cover - never ingested
+        raise NotImplementedError
+
+    def recall(self, query: str) -> Recall:
+        index = int(query.split()[-1])
+        time.sleep(self.unit * (self.n - index))
+        with self._lock:
+            self.threads.add(threading.get_ident())
+            self.completed.append(query)
+        return Recall(context=f"body for {query}", provenance=(f"s{index}",))
+
+
+@needs_langchain
+class TestPlanExecute:
+    """Fan-out/fan-in: several different questions, one join."""
+
+    def test_each_part_gets_its_own_retrieval(self) -> None:
+        llm = StubLLM(plan_parts=["where do I live", "what is my cat called"])
+        store = build_store("bm25", llm, EVENTS)
+        attempt = get_orchestrator("plan_execute")(llm).run(
+            store, "where does my cat live"
+        )
+
+        assert attempt.hops == 2
+        assert attempt.queries == ("where do I live", "what is my cat called")
+
+    def test_branch_order_survives_reversed_completion(self) -> None:
+        """The branches really do run on worker threads, so the store can
+        return them in any order. If the record followed completion order, the
+        queries `arena inspect` prints would reshuffle between two runs of the
+        same cell -- error-analysis output that cannot be diffed is not much
+        use.
+
+        `SlowStore` makes the earliest-dispatched query the slowest, which
+        reverses completion order outright rather than hoping to catch a race.
+        """
+        n = 4
+        store = SlowStore(n)
+        llm = StubLLM(plan_parts=[f"part {i}" for i in range(n)])
+
+        attempt = get_orchestrator("plan_execute")(llm, max_hops=n).run(store, "q")
+
+        assert store.completed == [f"part {i}" for i in reversed(range(n))], (
+            "the fixture is supposed to invert completion order; if this fails "
+            "the test below is passing for the wrong reason"
+        )
+        assert len(store.threads) > 1, "a fan-out that never forked proves nothing"
+        assert attempt.queries == tuple(f"part {i}" for i in range(n))
+        assert attempt.provenance == tuple(f"s{i}" for i in range(n))
+        assert attempt.hops == n
+
+    def test_the_join_reads_parts_in_plan_order(self) -> None:
+        """Same argument one level up: the answer prompt is cache-keyed too."""
+        store = SlowStore(3)
+        llm = StubLLM(plan_parts=[f"part {i}" for i in range(3)])
+
+        get_orchestrator("plan_execute")(llm, max_hops=3).run(store, "q")
+
+        prompt = next(p for phase, p in llm.calls if phase == "answer")
+        headers = [
+            line for line in prompt.splitlines() if line.startswith("--- part ")
+        ]
+
+        assert [h.split("'")[1] for h in headers] == ["part 0", "part 1", "part 2"]
+
+    def test_the_plan_cannot_outspend_the_budget(self) -> None:
+        llm = StubLLM(plan_parts=["a", "b", "c", "d", "e"])
+        store = build_store("bm25", llm, EVENTS)
+        attempt = get_orchestrator("plan_execute")(llm, max_hops=3).run(store, "q")
+
+        assert attempt.hops == 3
+
+    def test_an_empty_plan_falls_back_to_the_question(self) -> None:
+        """No branches means the join is never reached and nothing is answered.
+        Degrading to single_shot is the only acceptable failure here."""
+        llm = StubLLM(plan_parts=[])
+        store = build_store("bm25", llm, EVENTS)
+        attempt = get_orchestrator("plan_execute")(llm).run(store, "where do I live")
+
+        assert attempt.queries == ("where do I live",)
+        assert "Durham" in attempt.text
+
+    def test_repeated_parts_are_dropped(self) -> None:
+        llm = StubLLM(plan_parts=["the cat", "The Cat ", "where I live"])
+        store = build_store("bm25", llm, EVENTS)
+        attempt = get_orchestrator("plan_execute")(llm).run(store, "q")
+
+        assert attempt.queries == ("the cat", "where I live")
+
+    def test_one_plan_call_and_one_answer_call(self) -> None:
+        """Branches must not answer their own sub-question: an orchestrator
+        wins by assembling better evidence, not by buying extra reasoning."""
+        llm = StubLLM(plan_parts=["a", "b", "c"])
+        store = build_store("bm25", llm, EVENTS)
+        get_orchestrator("plan_execute")(llm, max_hops=3).run(store, "q")
+
+        assert len(llm.ledger.by_phase("orchestrate")) == 1
+        assert len(llm.ledger.by_phase("answer")) == 1
+
+    def test_every_branch_reaches_the_join(self) -> None:
+        llm = StubLLM(plan_parts=["where do I live", "what is my cat called"])
+        store = build_store("bm25", llm, EVENTS)
+        get_orchestrator("plan_execute")(llm).run(store, "q")
+
+        answers = [p for phase, p in llm.calls if phase == "answer"]
+        assert len(answers) == 1
+        assert answers[0].count("--- part ") == 2
+        assert "Durham" in answers[0] and "Miso" in answers[0]
+
+
 @needs_langchain
 class TestMatrixAcrossBothAxes:
-    def test_all_three_orchestrators_run_and_report(
+    def test_all_five_orchestrators_run_and_report(
         self, tiny_task: Task, stub_factory, tmp_path: Path
     ) -> None:
-        orders = ["single_shot", "loop", "graph"]
+        orders = ["single_shot", "fanout", "loop", "graph", "plan_execute"]
         results = runner.run_matrix(
             ["bm25", "full_transcript"],
             [tiny_task],
@@ -369,20 +569,23 @@ class TestMatrixAcrossBothAxes:
             llm_factory=stub_factory,
         )
 
-        assert len(results) == 6
+        assert len(results) == 10
         assert all(r.error is None for r in results), [r.error for r in results]
         assert {r.orchestrator for r in results} == set(orders)
 
         summary = report.summarize(results)
         assert set(summary) == {
-            "bm25",
-            "full_transcript",
-            "bm25/loop",
-            "full_transcript/loop",
-            "bm25/graph",
-            "full_transcript/graph",
+            f"{backend}{suffix}"
+            for backend in ("bm25", "full_transcript")
+            for suffix in ("", "/fanout", "/loop", "/graph", "/plan_execute")
         }
-        assert report.orchestrators_in(summary) == ["single_shot", "graph", "loop"]
+        assert report.orchestrators_in(summary) == [
+            "single_shot",
+            "fanout",
+            "graph",
+            "loop",
+            "plan_execute",
+        ]
 
         table = report.to_markdown(summary)
         assert "Orchestration: does searching again pay for itself?" in table

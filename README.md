@@ -1,6 +1,6 @@
 # Memory Arena
 
-**Seven memory architectures x three orchestration styles. One task suite.
+**Seven memory architectures x five orchestration styles. One task suite.
 Measured against each other.**
 
 Every memory library claims to beat "naive RAG." Every agent framework claims
@@ -15,7 +15,7 @@ Two axes, deliberately orthogonal:
 | Axis | Question | Values |
 |---|---|---|
 | **Memory** | What is worth remembering, and in what form? | 7 backends |
-| **Orchestration** | Who decides when the agent has looked hard enough? | `single_shot`, `loop`, `graph` |
+| **Orchestration** | Who decides when the agent has looked hard enough? | 5 styles |
 
 The interesting result is not which backend wins. It is that they win on
 different probe types, that the expensive ones don't always win at all, and that
@@ -41,20 +41,30 @@ class Memory(ABC):
 | Backend | What it tests | Write cost |
 |---|---|---|
 | `full_transcript` | Control — everything in context, no retrieval | free |
-| `window_summary` | The default most agents ship | 1 LLM call / 4 turns |
+| `window_summary` | Compaction, the framework default — at stress settings | 1 LLM call / 4 turns |
 | `bm25` | Lexical baseline. Stubbornly hard to beat | free |
 | `vector` | Dense embeddings, the standard RAG answer | free (local model) |
 | `entity_graph` | Triples + k-hop walks: does structure beat similarity? | 1 LLM call / turn |
 | `temporal_graph` | Bi-temporal facts — memory as *belief revision* | 1 LLM call / turn |
 | `agent_notes` | Model authors its own markdown, Claude-Code style | 1 LLM call / 4 turns |
 
+`window_summary` needs one caveat, because it is the row most likely to be read
+as a replica of what shipping agents do. The mechanism is right — summarize the
+old, keep the recent, and every framework ships a version of it. The settings
+are not. Real compaction fires on *token pressure*, near the end of a very large
+window; this folds every four turns into 250 words. That is deliberate, because
+it makes the failure mode legible in a short session, but it means the row
+measures how badly lossy compression degrades rather than how the deployed thing
+behaves. Nor is compaction ever the whole memory system in production: it sits
+alongside agent-authored notes and search over the raw history, which are
+`agent_notes` and `bm25` here. Read it as a stress test of one layer.
+
 ## The second interface
 
 `Memory` decides what gets stored. It says nothing about how hard the agent
 works to find it — and that turns out to be a separate, measurable choice.
 
-An orchestrator turns a question plus a store into an answer. There are three,
-and they differ in exactly one respect: who owns the decision to search again.
+An orchestrator turns a question plus a store into an answer. There are five.
 
 ```python
 class Orchestrator(ABC):
@@ -65,8 +75,18 @@ class Orchestrator(ABC):
 | Orchestrator | Who owns control flow | Implementation |
 |---|---|---|
 | `single_shot` | Nobody. One recall, one answer. | ~10 lines, no framework |
+| `fanout` | Nobody, but wider. Every query written before any of them runs. | ~60 lines, no framework |
+| `plan_execute` | You, once. The question is *split*, not reworded. | LangGraph `Send` |
 | `loop` | **The model.** It calls a `recall` tool until satisfied. | LangChain `create_agent` |
 | `graph` | **You.** An explicit retrieve/assess cycle with a declared exit. | LangGraph `StateGraph` |
+
+Two things vary across those five, not one, and the pair is what makes the set
+worth running:
+
+| | one query, reworded | several distinct questions |
+|---|---|---|
+| **no feedback** | `single_shot`, `fanout` | `plan_execute` |
+| **feedback** | `loop`, `graph` | — |
 
 ### Loop engineering vs. graph engineering
 
@@ -98,14 +118,72 @@ decision to get it. The table the report prints asks whether that trade landed.
 
 To keep the comparison fair rather than flattering:
 
-- **The answer prompt is identical across all three.** `graph` and `single_shot`
-  literally call the same `agent.answer()`; `loop` shares the same `RULES` block.
-  Anything an orchestrator wins, it wins by assembling better evidence.
+- **The answer prompt is identical across all five.** `graph`, `fanout`,
+  `plan_execute` and `single_shot` literally call the same `agent.answer()`;
+  `loop` shares the same `RULES` block. Anything an orchestrator wins, it wins
+  by assembling better evidence.
+- **No orchestrator gets extra reasoning calls.** `plan_execute` fans out across
+  sub-questions and could plausibly answer each one on its branch. It does not:
+  the branches retrieve, and a single answer call joins them. Per-branch answers
+  would win by spending calls the other four were never given.
 - **`graph` assesses and reformulates in one model call**, not two. Splitting
   them reads better on a diagram but would spend 2x per cycle against the loop's
   1x, and this is a cost comparison.
-- **Both are capped at `--max-hops` (default 4).** An unbounded loop is not a
-  baseline, it is a bill.
+- **Everything but `single_shot` is capped at `--max-hops` (default 4)**, and
+  spends the same retrieval budget. An unbounded loop is not a baseline, it is
+  a bill.
+
+### The ablation: was it adaptivity, or just more searches?
+
+When `loop` or `graph` beats `single_shot`, it beats it on two counts at once —
+more searches, *and* searches informed by what came back. The table cannot say
+which half did the work, and the two have very different implications for what
+to build next. `fanout` is the control that separates them:
+
+```
+fanout  the cycle is deleted, the budget is not
+        prompt -> [model writes all N queries at once] -> retrieve x N -> answer
+        same opening query, same hop budget, same instruction to phrase
+        queries the way stored text would -- and no evidence to condition on
+```
+
+It is held identical to `graph` on everything except information. The first hop
+is the question verbatim, so its evidence is a strict superset of what
+`single_shot` saw. The budget is `--max-hops`, the same leash. The only
+difference is that its later queries are written *before* any result comes back.
+
+So the reading is unambiguous. If `fanout` ties the iterative rows, the extra
+searches were the whole story and the per-hop assessment call bought nothing —
+and since `fanout` spends **one** `orchestrate` call regardless of fan width
+against the graph's one per cycle, a tie is a straight loss for the graph on
+cost. If the iterative rows pull ahead of it, that gap is what adaptivity is
+actually worth, stated in points and dollars.
+
+### Decomposition is a different capability, not a different policy
+
+The other four orchestrators all ask one question and differ only in how many
+times they reword it. `plan_execute` asks several different ones: a planning
+call splits the question into independently answerable parts, each part
+retrieves on its own LangGraph branch, and one answer call joins them.
+
+That matters most where rewording structurally cannot help. A `multi_hop` probe
+is a join across turns that share no vocabulary — no rephrasing of the original
+question retrieves both halves, because the halves are not phrased alike, but
+two sub-questions retrieve one each. It is also the only orchestrator with a
+mechanism for `aggregation`, which needs a fold rather than a lookup. That
+column has no data in either corpus, so this is a mechanism waiting for a
+benchmark rather than a result.
+
+`Send` is what makes it a graph rather than a chain: the branch count is not
+known until the plan node has run, so the fan-out cannot be drawn in advance.
+Branches genuinely run on worker threads, which cost the harness two things it
+had been getting for free from sequential orchestrators. `Retriever` now takes a
+lock, because `hops` and `chars` were read-modify-write on shared ints and a
+silently undercounted hop is a cost comparison that lies. And `fetch` takes an
+`order`, so the queries `arena inspect` prints come back in plan order rather
+than in whatever order the store happened to finish — the answer prompt is
+sorted separately by the join node, which is the ordering the response cache
+actually keys on.
 
 ### LangChain runs on the harness, not beside it
 
@@ -205,7 +283,7 @@ Three things it buys that LongMemEval cannot:
 
 | | |
 |---|---|
-| **A real haystack** | Retrieval precision and efficiency were pinned at 1.00 on `oracle` because everything retrieved was gold. On LoCoMo, `bm25` scores recall 0.81 / precision 0.17 — numbers with signal in them. |
+| **A real haystack** | On `oracle` the haystack *is* the gold session set — for all 500 instances — so session-grain precision is 1.00 for any backend that retrieves anything at all. LoCoMo's 19–32 sessions per question give that grain something to be wrong about. (Turn-grain grading, below, since fixed the same blind spot on `oracle` itself.) |
 | **Distractors** | Category-5 questions are adversarial: they attribute an event to the wrong speaker, and `adversarial_answer` holds the answer a fooled model gives. That is exactly `must_not_contain`, and it makes the deterministic gate live. |
 | **Probes per haystack** | One conversation is ingested once and asked ~200 questions, against LongMemEval's one question per haystack. Roughly 8× more probe per extraction call — and the first corpus that makes `report.score_stat`'s cluster-by-task interval do real work. |
 
@@ -234,8 +312,11 @@ nothing changes: the matrix is backends x tasks under `single_shot`, exactly as
 before.
 
 ```bash
-# One backend, all three orchestration styles -- the loop-vs-graph comparison
-uv run arena run -b bm25 -o single_shot -o loop -o graph
+# One backend, every orchestration style
+uv run arena run -b bm25 -o single_shot -o fanout -o plan_execute -o loop -o graph
+
+# The ablation on its own: did adaptivity pay, or was it just more searches?
+uv run arena run -b bm25 -o fanout -o graph
 
 # Cross both axes, and give the iterative ones a longer leash
 uv run arena run -b bm25 -b temporal_graph -o single_shot -o graph --max-hops 6
@@ -291,26 +372,66 @@ The answer score confounds two failures. A backend can score badly because it
 never retrieved the evidence, or because it retrieved it and the agent fumbled
 it — and those are different bugs with different fixes.
 
-LongMemEval ships `answer_session_ids`, and every retrieval backend already
-reports which turns it handed over, so the report grades retrieval directly:
+Both corpora ship the annotation that separates them, and every retrieval
+backend already reports which turns it handed over, so the report grades
+retrieval directly — at two grains:
 
 | | what it says |
 |---|---|
-| **Evidence recall** | share of gold sessions the store actually surfaced |
-| **Precision** | share of surfaced sessions that were gold |
-| **Efficiency** | share of retrieved material that was worth retrieving |
+| **Turn recall** | share of the gold *turns* the store actually surfaced |
+| **Turn precision** | share of surfaced turns that were gold |
+| **Turn efficiency** | share of retrieved characters that came from a gold turn |
+| **Session recall** | share of gold *sessions* surfaced — the floor |
+| **Session precision** | share of surfaced sessions that were gold — the floor |
 
-No model is involved, which makes these the only numbers in the harness that do
-not move when the judge model changes. `agent_notes` and `window_summary` are
-excluded rather than scored: both answer from text they rewrote, so there is no
-turn to trace back to, and the report says so instead of quietly scoring them
-zero.
+Turn grain is the headline because session grain cannot see the difference
+between a store that found the right conversation and one that found the
+sentence. On `oracle` it cannot see anything at all: every haystack session is a
+gold session, so session precision is 1.00 by construction. Only 7% of the built
+corpus's turns are flagged as carrying an answer, and graded against those the
+same retrieval separates. Scoring `bm25` at its default top-8 on one query per
+probe — retrieval only, no orchestrator and no model — the two grains disagree
+sharply:
 
-This needs session ids in the task files. **Corpora built before this landed
-still run — they simply report no retrieval scores.** Rebuild to pick it up:
+| | session recall | session precision | turn recall | turn precision |
+|---|---|---|---|---|
+| LongMemEval `oracle` | 0.98 | 1.00 | 0.74 | 0.18 |
+| LoCoMo | 0.77 | 0.15 | 0.40 | 0.07 |
+
+An orchestrator that issues several queries will beat those, which is the point:
+they are a floor the coarse grain was hiding.
+
+Where the annotation comes from:
+
+| Corpus | Session gold | Turn gold |
+|---|---|---|
+| LongMemEval | `answer_session_ids` | per-turn `has_answer` flag |
+| LoCoMo | derived from the evidence ids | `evidence: ['D1:3']`, turn-level already |
+
+Coverage is close to total and the gaps are principled rather than missing.
+All 500 LongMemEval instances carry both, and every flagged turn falls inside a
+declared gold session. The exception is abstention: on 21 of the 30 `_abs`
+questions no turn is flagged, because there is no answer for a turn to hold.
+Those are graded at session grain only and drop out of the turn-grain
+denominator rather than being counted as a retrieval miss. LoCoMo annotates
+1,982 of its 1,986 questions — the four without are all category 3, which this
+harness drops anyway — and after discarding the nine evidence ids that name
+turns absent from the transcript, exactly two of the 1,890 mapped questions are
+left ungraded.
+
+No model is involved in any of it, which makes these the only numbers in the
+harness that do not move when the judge model changes. `agent_notes` and
+`window_summary` are excluded rather than scored: both answer from text they
+rewrote, so there is no turn to trace back to, and the report says so instead of
+quietly scoring them zero.
+
+This needs session and turn ids in the task files. **Corpora built before this
+landed still run — they report whichever grain they carry, or no retrieval
+scores at all.** Rebuild to pick both up:
 
 ```bash
 python scripts/build_longmemeval.py
+python scripts/build_locomo.py
 ```
 
 ---
@@ -452,11 +573,13 @@ judge call is spent. Everything else goes to a rubric judge.
    long-context, testing an attention window rather than a memory store. The
    probe type stays in the harness because it is a real thing memory should do;
    the column is simply empty, which is more honest than filling it with
-   relabelled multi-hop questions.
+   relabelled multi-hop questions. `plan_execute` is the orchestrator that
+   would exploit such data, and it is currently untested on the one probe type
+   it was built for.
 7. **Prices are hardcoded** in `llm.py` from a June 2026 snapshot and drift.
 8. **The hop cap is a free parameter, and it moves the result.** Four is a
-   guess. `loop` and `graph` are both bounded by it, so the comparison between
-   them is fair at any setting, but neither number means much in isolation —
+   guess. All four non-trivial orchestrators are bounded by it, so comparisons
+   among them are fair at any setting, but no number means much in isolation —
    quote `--max-hops` alongside any orchestration figure. The orchestration
    table now prints a `Capped` column: the share of probes that stopped because
    the budget ran out rather than because the policy was satisfied. When that
@@ -474,7 +597,24 @@ judge call is spent. Everything else goes to a rubric judge.
    wrong in both directions: stopping early on thin evidence, or burning hops
    chasing a fact the store never held. That is a property of this graph, not of
    graph orchestration, and a better exit condition is the obvious next
-   experiment.
+   experiment. `fanout` is partly a hedge against it: having no exit condition
+   at all, it cannot suffer from a bad one, so a `graph` that loses to it has
+   probably lost to its own assessor rather than to its topology.
+11. **`fanout` and `plan_execute` are only as good as one blind model call.**
+   Both write their entire search plan before seeing any evidence, so a bad
+   plan cannot be recovered from — that is the design, not a defect, but it
+   makes both unusually sensitive to the planning prompt and to model size. On
+   a small local model expect the rewrites to collapse into near-duplicates of
+   the question, which `_distinct` will drop, quietly narrowing the fan below
+   the budget the row is being charged for. Check `hops` before reading the
+   score.
+12. **Neither axis covers context isolation.** The move current agent systems
+   lean on hardest — spawn a sub-agent with a fresh window, let it do the
+   expensive reading, return only its conclusion — appears in neither table. It
+   is not a store, and not a control-flow policy over one store, so it has no
+   cell in a 7x5 grid built from those two interfaces. The matrix maps the
+   design space it declares; it does not map everything production does about
+   memory.
 
 ## Roadmap
 
@@ -488,8 +628,20 @@ judge call is spent. Everything else goes to a rubric judge.
       turn make it into context at all?) to separate retrieval failures from
       reasoning failures — `evidence.py`
 - [ ] Sweep `--max-hops` to find where the orchestration lift saturates
-- [ ] A non-LLM exit condition for `graph` (retrieval score threshold) as an
-      ablation against the model-judged one
+- [ ] A non-LLM exit condition for `graph` — stop when a hop returns no
+      provenance ids that are new, which is free, model-free, and uniform
+      across backends in a way a BM25 score threshold is not
+- [x] `fanout` — breadth without feedback, so the iterative rows can be read
+      against something that searches as widely and adapts not at all
+- [x] `plan_execute` — decomposition, the only orchestrator that asks more than
+      one question
+- [ ] A sub-agent orchestrator — context isolation as a sixth style, the one
+      production strategy neither axis currently represents
+- [ ] An oracle-router number: the best score reachable by picking the right
+      orchestrator per probe, computed from `runs.json` with no new API calls.
+      It is the headroom a real router would be chasing, and it is free
+- [ ] A `reflect` orchestrator — verify the drafted answer against the store
+      before returning it, aimed at the `negation` fabrication failure
 
 ## Layout
 
@@ -498,13 +650,14 @@ src/arena/
   memory.py       the two-method interface every backend implements
   providers.py    Anthropic + OpenAI-compatible transports, JSON salvage
   llm.py          caching client, phase-tagged ledger, per-phase model routing
-  agent.py        the agent under test — one prompt, shared by all three
+  agent.py        the agent under test — one prompt, shared by all five
   judge.py        deterministic guard + rubric judge + calibration
-  evidence.py     retrieval graded against gold sessions — the one metric with
-                  no model in it
+  evidence.py     retrieval graded against gold turns and sessions — the one
+                  metric with no model in it
   orchestration.py  the control-flow interface, registry, and hop accounting
-  orchestrators/  single_shot (no deps), loop (LangChain), graph (LangGraph),
-                  adapter.py — BaseChatModel over the arena's cached client
+  orchestrators/  single_shot and fanout (no deps), loop (LangChain), graph and
+                  plan_execute (LangGraph), adapter.py — BaseChatModel over the
+                  arena's cached client
   runner.py       the (backend x orchestrator x task x trial) matrix
   report.py       aggregation, intervals, pass^k, markdown table, charts
   backends/       one file per architecture
@@ -521,7 +674,7 @@ tests/            offline suite — stub LLM, no network
 ```
 
 ```bash
-uv run pytest -q                                    # 167 tests, no model needed
+uv run pytest -q                                    # 184 tests, no model needed
 uv run pytest --cov=src/arena --cov-report=term-missing
 ```
 
@@ -530,10 +683,19 @@ local server. It covers the JSON-salvage paths (markdown fences, reasoning
 blocks, braces inside strings, the repair round trip) and the graph-retrieval
 regressions found by the first real run.
 
-The stub speaks tool calls too, so the loop and the graph run offline against a
+The stub speaks tool calls too, so every orchestrator runs offline against a
 scripted model: `tool_hops` sets how many times it asks to search, `assess_hops`
-how many times the graph's exit condition says "not yet". That is what lets the
-tests assert that the cycle actually cycles, that the hop cap holds against a
-model that will not stop, and that control-flow tokens land in the right column
-— none of which you can pin down against a real model that might simply choose
-not to loop. Tests for `loop` and `graph` skip cleanly without the extra.
+how many times the graph's exit condition says "not yet", and `rewrites` /
+`plan_parts` are the search plans `fanout` and `plan_execute` write up front.
+That is what lets the tests assert that the cycle actually cycles, that the hop
+cap holds against a model that will not stop, and that control-flow tokens land
+in the right column — none of which you can pin down against a real model that
+might simply choose not to loop.
+
+`plan_execute` gets one more: its branches really do run concurrently, so a
+fixture store makes the first-dispatched query the slowest and the test asserts
+that the recorded queries and provenance still come back in plan order.
+Completion order is inverted outright rather than raced for, which is the only
+way that guarantee is worth having. Tests for the framework-backed three skip
+cleanly without the extra; `fanout` runs on the base install, because a control
+that needs an optional dependency is a control you cannot always run.

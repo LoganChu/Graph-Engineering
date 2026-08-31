@@ -22,16 +22,29 @@ over the `s` variant and the variant choice is really a budget choice:
 it. `stratified()` exists so that subsetting does not quietly skew the probe-type
 mix that the report buckets by.
 
-One thing the dataset gives us that the hand-authored tasks never could:
-`answer_session_ids`, the sessions that actually carry the answer. Those ride
-through onto `Probe.gold_sessions`, and each turn keeps its `session` id, which
-lets `evidence.py` grade *retrieval* against ground truth with no model in the
-loop. It is the only metric here that does not move when the judge changes, and
-it separates the two failures the answer score cannot: the store never found the
+One thing the dataset gives us that the hand-authored tasks never could: gold
+annotation, at two grains. `answer_session_ids` names the sessions that carry
+the answer and rides through onto `Probe.gold_sessions`; a per-turn `has_answer`
+flag names the individual turns and rides through onto `Probe.gold_turns`. Both
+are present on all 500 instances of both variants, and every flagged turn falls
+inside a declared gold session, so the two grains agree. That lets `evidence.py`
+grade *retrieval* against ground truth with no model in the loop -- the only
+metric here that does not move when the judge changes, and the one that
+separates the two failures the answer score cannot: the store never found the
 evidence, versus the store found it and the agent fumbled it.
 
-Task files built before this existed still load -- they simply carry no session
-ids and score `None` for evidence. Re-run the builder to pick it up.
+The turn grain is the one worth having. On `oracle` the haystack *is* the gold
+session set for every instance, so session precision is 1.00 by construction and
+session recall asks only whether a store returned the sessions it was handed.
+Only 896 of oracle's 10,960 turns are flagged -- 8.2% -- so the same retrieval
+graded at turn grain is measuring something.
+
+Two caveats it is better to state than to smooth over. `has_answer` is silent on
+21 of the 30 abstention instances: they are questions with no answer, so no turn
+carries one, and those probes are gradeable only at session grain -- where
+"gold" means the sessions that set up a premise the question falsely extends.
+And task files built before any of this landed still load; they carry no ids and
+score `None` for evidence. Re-run the builder to pick it up.
 
 One thing the dataset cannot give us: `must_not_contain`. The hard-fail guard
 needs a distractor string and LongMemEval ships no such annotation, so imported
@@ -113,18 +126,29 @@ def to_task(instance: dict[str, Any]) -> dict[str, Any]:
     order = sorted(range(len(sessions)), key=lambda i: (dates[i], i))
 
     turns: list[dict[str, Any]] = []
+    gold_turns: list[str] = []
     for i in order:
-        for turn in sessions[i]:
+        session_id = ids[i]
+        for position, turn in enumerate(sessions[i]):
+            # LongMemEval gives its turns no id of their own, so one is
+            # synthesised from the session and the position within it. It has
+            # to be stable across a rebuild -- position within the session is,
+            # where a position within the flattened haystack would shift the
+            # moment an earlier session gained a turn.
+            ref = f"{session_id}:{position}" if session_id else ""
             turns.append(
                 {
                     "t": dates[i],
                     "speaker": turn.get("role", "user"),
                     "text": turn["content"],
-                    # Carried through so retrieval can be graded against
-                    # `answer_session_ids` without a model in the loop.
-                    "session": ids[i],
+                    # Both ids are carried through so retrieval can be graded
+                    # against the shipped annotation with no model in the loop.
+                    "session": session_id,
+                    "ref": ref,
                 }
             )
+            if ref and turn.get("has_answer"):
+                gold_turns.append(ref)
 
     kind = probe_type(instance)
     n_evidence = sum(1 for i in order if ids[i] in evidence)
@@ -140,7 +164,7 @@ def to_task(instance: dict[str, Any]) -> dict[str, Any]:
             f"LongMemEval {instance['question_type']}"
             + (" (abstention)" if kind == "negation" else "")
             + f". {len(sessions)} sessions, {len(turns)} turns, "
-            f"{n_evidence} carrying evidence."
+            f"{n_evidence} carrying evidence, {len(gold_turns)} answer turns."
         ),
         "turns": turns,
         "probes": [
@@ -154,6 +178,11 @@ def to_task(instance: dict[str, Any]) -> dict[str, Any]:
                 # `answer` is an int on 32 of the 500 instances.
                 "expected": str(instance["answer"]),
                 "gold_sessions": gold,
+                # Empty on the 21 abstention instances that flag no turn: there
+                # is no answer turn because there is no answer. Those stay
+                # gradeable at session grain and drop out of the turn-grain
+                # denominator, which is the honest place for them.
+                "gold_turns": gold_turns,
             }
         ],
     }

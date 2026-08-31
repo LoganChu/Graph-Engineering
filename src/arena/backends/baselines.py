@@ -2,7 +2,10 @@
 
 `full_transcript` is the ceiling: everything ever said, no retrieval step. Any
 architecture that cannot beat it on accuracy is only worth its cost savings.
-`window_summary` is the default most production agents actually ship.
+`window_summary` is the compaction primitive every framework ships, run at
+benchmark-aggressive settings: four turns folded into 250 words, where a
+deployed agent compacts only under token pressure and against a far larger
+window. It stresses the mechanism rather than reproducing the deployment.
 """
 
 from __future__ import annotations

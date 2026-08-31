@@ -36,10 +36,15 @@ def make_event(turn_id: int, session: str, text: str = "hello there") -> Event:
         text=text,
         at=date(2025, 1, 1),
         session_id=session,
+        ref=f"{session}:{turn_id}",
     )
 
 
-def make_probe(probe_id: str = "p1", gold: tuple[str, ...] = ("s1",)) -> Probe:
+def make_probe(
+    probe_id: str = "p1",
+    gold: tuple[str, ...] = ("s1",),
+    gold_turns: tuple[str, ...] = (),
+) -> Probe:
     return Probe(
         probe_id=probe_id,
         after_turn=1,
@@ -47,6 +52,7 @@ def make_probe(probe_id: str = "p1", gold: tuple[str, ...] = ("s1",)) -> Probe:
         question="q",
         expected="a",
         gold_sessions=gold,
+        gold_turns=gold_turns,
     )
 
 
@@ -197,6 +203,83 @@ class TestEvidence:
         agg = evidence.aggregate([s for s in scores if s])
         assert agg["evidence_recall"] == pytest.approx(0.5)
         assert agg["evidence_n"] == 2
+
+    def test_a_session_only_probe_still_grades_at_the_coarse_grain(self):
+        """Not every corpus annotates turns. Those probes are not ungradeable."""
+        score = evidence.score(
+            make_probe(gold=("s1",)), self.events, self.attempt(("1",))
+        )
+        assert score is not None
+        assert score.recall == 1.0
+        assert score.n_gold_turns == 0
+
+
+class TestEvidenceTurnGrain:
+    """The grain that separates 'found the right session' from 'found the turn'.
+
+    Session grain cannot make that distinction at all, and on LongMemEval's
+    `oracle` split it cannot make any distinction: the haystack is the gold
+    session set, so session precision is 1.00 for anything that retrieves.
+    """
+
+    events = (
+        make_event(1, "s1", text="filler"),
+        make_event(2, "s1", text="the answer"),
+        make_event(3, "s2", text="filler"),
+    )
+
+    def attempt(self, provenance: tuple[str, ...]) -> Attempt:
+        return Attempt(text="a", provenance=provenance)
+
+    def probe(self, **over):
+        return make_probe(gold=("s1",), gold_turns=("s1:2",), **over)
+
+    def test_the_right_session_is_not_the_right_turn(self):
+        """The whole reason this grain exists: session grain calls this perfect."""
+        score = evidence.score(self.probe(), self.events, self.attempt(("1",)))
+        assert score is not None
+        assert score.recall == 1.0       # s1 was retrieved
+        assert score.turn_recall == 0.0  # the turn that says it was not
+
+    def test_precision_is_measured_over_turns_not_sessions(self):
+        score = evidence.score(self.probe(), self.events, self.attempt(("1", "2")))
+        assert score is not None
+        assert score.precision == 1.0
+        assert score.turn_recall == 1.0
+        assert score.turn_precision == pytest.approx(0.5)
+
+    def test_efficiency_charges_for_the_session_dragged_along(self):
+        """A whole gold session is 1.00 efficient at session grain and less here."""
+        score = evidence.score(self.probe(), self.events, self.attempt(("1", "2")))
+        assert score is not None
+        assert score.efficiency == 1.0
+        assert score.turn_efficiency < 1.0
+
+    def test_turn_gold_is_restricted_to_what_had_been_observed(self):
+        early = self.events[:1]
+        score = evidence.score(
+            make_probe(gold=(), gold_turns=("s1:2",)), early, self.attempt(("1",))
+        )
+        assert score is None
+
+    def test_aggregate_keeps_the_two_denominators_apart(self):
+        """A probe with no turn gold is corpus silence, not a backend miss."""
+        scores = [
+            evidence.score(self.probe(), self.events, self.attempt(("2",))),
+            evidence.score(make_probe(gold=("s2",)), self.events, self.attempt(("3",))),
+        ]
+        agg = evidence.aggregate([s for s in scores if s])
+        assert agg["evidence_n"] == 2
+        assert agg["evidence_turn_n"] == 1
+        assert agg["evidence_turn_recall"] == 1.0
+
+    def test_turn_keys_are_absent_when_nothing_was_annotated_that_finely(self):
+        score = evidence.score(
+            make_probe(gold=("s1",)), self.events, self.attempt(("1",))
+        )
+        agg = evidence.aggregate([score] if score else [])
+        assert "evidence_recall" in agg
+        assert "evidence_turn_recall" not in agg
 
 
 class TestRetrieverProvenance:

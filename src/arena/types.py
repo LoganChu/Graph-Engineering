@@ -34,7 +34,10 @@ Phase = Literal["write", "read", "answer", "judge", "orchestrate"]
 # cap, not about the policy. Reporting the mix is the only way to know whether
 # `--max-hops` is binding the comparison being published.
 Stop = Literal[
-    "answered",         # single_shot: there was never a second hop to take
+    "answered",         # no adaptive decision was ever on offer: single_shot
+                        # had one hop, and fanout / plan_execute spend a budget
+                        # fixed before the first result came back. Not the same
+                        # thing as hop_cap, which is a policy cut short
     "sufficient",       # the policy decided it had enough
     "hop_cap",          # ran out of budget with the question still open
     "recursion_limit",  # the loop would not terminate on its own
@@ -56,11 +59,15 @@ class Event:
     speaker: str
     text: str
     at: date
-    #: Which source session this turn came from. LongMemEval marks its gold
-    #: evidence at session granularity, so this is what makes retrieval
-    #: gradeable; hand-authored tasks leave it empty and are scored on the
+    #: Which source session this turn came from -- the coarse half of the gold
+    #: annotation. Hand-authored tasks leave it empty and are scored on the
     #: answer alone.
     session_id: str = ""
+    #: The corpus's own id for this turn: LoCoMo's `dia_id` ("D1:3"),
+    #: LongMemEval's session id plus position within the session. It is what
+    #: `Probe.gold_turns` names, and unlike the positional `turn_id` it survives
+    #: a rebuild that adds or drops turns elsewhere in the haystack.
+    ref: str = ""
 
     def render(self) -> str:
         return f"[{self.at.isoformat()}] {self.speaker}: {self.text}"
@@ -76,10 +83,15 @@ class Probe:
     question: str
     expected: str
     must_not_contain: tuple[str, ...] = ()
-    #: Sessions that actually carry the answer. Present for imported corpora
-    #: that ship the annotation; empty means retrieval cannot be graded for
-    #: this probe and only the answer is scored.
+    #: Sessions that carry the answer -- the coarse grain, and the only one some
+    #: corpora support.
     gold_sessions: tuple[str, ...] = ()
+    #: `Event.ref`s of the turns that carry it. This is the grain that separates
+    #: a store which surfaced the right session from one which surfaced the
+    #: right sentence. Empty when the corpus annotates sessions only, and on the
+    #: 21 LongMemEval abstention instances that flag no answer turn at all
+    #: because there is no answer.
+    gold_turns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +124,15 @@ class EvidenceScore:
     same score with `recall` near 0.0 is a memory failure. Those are different
     bugs, and one number cannot tell them apart.
 
+    Two grains are kept, because the coarse one goes degenerate exactly where
+    this harness spends most of its budget. On LongMemEval's `oracle` split the
+    haystack *is* the gold session set -- for all 500 instances -- so session
+    precision is 1.00 for any backend that retrieves anything, and session
+    recall only asks whether a store found the sessions it was handed. At turn
+    grain that same split is 8.2% needle and the numbers separate again. The
+    session counts stay because they are what a session-only corpus can support
+    and what earlier runs were scored on.
+
     Counts rather than ratios are stored so the report can micro-average across
     probes instead of averaging ratios over different denominators.
     """
@@ -121,6 +142,14 @@ class EvidenceScore:
     n_sessions: int       # distinct sessions retrieved
     gold_chars: int       # chars of retrieved turns belonging to gold sessions
     retrieved_chars: int  # chars of every retrieved turn
+    #: The same shape at turn grain. `n_gold_turns == 0` means the probe ships
+    #: no turn-level annotation -- not that the store missed everything -- so
+    #: the report leaves those columns blank rather than printing a zero that
+    #: would average in as a failure.
+    n_gold_turns: int = 0
+    n_hit_turns: int = 0
+    n_turns: int = 0          # distinct turns retrieved
+    gold_turn_chars: int = 0  # chars of retrieved turns that are themselves gold
 
     @property
     def recall(self) -> float:
@@ -139,6 +168,26 @@ class EvidenceScore:
         penalised for how compactly it renders.
         """
         return self.gold_chars / self.retrieved_chars if self.retrieved_chars else 0.0
+
+    @property
+    def turn_recall(self) -> float:
+        return self.n_hit_turns / self.n_gold_turns if self.n_gold_turns else 0.0
+
+    @property
+    def turn_precision(self) -> float:
+        return self.n_hit_turns / self.n_turns if self.n_turns else 0.0
+
+    @property
+    def turn_efficiency(self) -> float:
+        """`efficiency` held to the tighter standard: gold turns, not gold sessions.
+
+        A store that hands back one whole gold session scores 1.00 on
+        `efficiency` and about 1/23 here, which is the honest number when a
+        single turn in that session carries the answer.
+        """
+        return (
+            self.gold_turn_chars / self.retrieved_chars if self.retrieved_chars else 0.0
+        )
 
 
 @dataclass(frozen=True)

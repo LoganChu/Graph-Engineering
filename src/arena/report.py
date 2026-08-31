@@ -279,31 +279,83 @@ def reliability_table(summary: dict) -> list[str]:
 
 
 def evidence_table(summary: dict) -> list[str]:
-    """Retrieval graded against the corpus's gold annotation, no judge involved."""
-    rows = [(n, m) for n, m in summary.items() if m.get("evidence_n")]
+    """Retrieval graded against the corpus's gold annotation, no judge involved.
+
+    Turn grain leads because session grain is degenerate on the split this
+    harness runs most: LongMemEval `oracle` ships only gold sessions, so session
+    precision is 1.00 for anything that retrieves at all. The session columns
+    stay for corpora that annotate no finer, and so that runs from before turn
+    grading landed remain comparable.
+    """
+    rows = [
+        (n, m)
+        for n, m in summary.items()
+        if m.get("evidence_n") or m.get("evidence_turn_n")
+    ]
     if not rows:
         return []
+
+    def cell(m: dict, key: str) -> str:
+        # A grain the corpus never annotated is left blank. A printed 0.00
+        # would read as a backend that retrieved nothing, which is a different
+        # claim entirely.
+        value = m.get(key)
+        return f"{value:.2f}" if value is not None else "--"
+
+    def graded(m: dict) -> str:
+        # Two numbers only when both grains graded something and disagreed. A
+        # summary written before turn grading existed has no turn count at all,
+        # and "0 / 60" there would read as a corpus gap rather than an old file.
+        turn, session = m.get("evidence_turn_n", 0), m.get("evidence_n", 0)
+        if turn and session and turn != session:
+            return f"{turn} / {session}"
+        return str(session or turn)
+
+    at_turn = any(m.get("evidence_turn_n") for _, m in rows)
     lines = [
         "",
         "### Retrieval quality (graded against gold evidence)",
         "",
-        "| Backend | Evidence recall | Precision | Efficiency | Probes graded |",
-        "|---" * 5 + "|",
+        "| Backend | Turn recall | Turn precision | Turn efficiency "
+        "| Session recall | Session precision | Probes graded |",
+        "|---" * 7 + "|",
     ]
-    for name, m in sorted(rows, key=lambda kv: kv[1]["evidence_recall"], reverse=True):
+    key = "evidence_turn_recall" if at_turn else "evidence_recall"
+    for name, m in sorted(rows, key=lambda kv: kv[1].get(key, 0.0), reverse=True):
         lines.append(
-            f"| `{name}` | {m['evidence_recall']:.2f} | "
-            f"{m['evidence_precision']:.2f} | {m['evidence_efficiency']:.2f} | "
-            f"{m['evidence_n']} |"
+            f"| `{name}` | {cell(m, 'evidence_turn_recall')} "
+            f"| {cell(m, 'evidence_turn_precision')} "
+            f"| {cell(m, 'evidence_turn_efficiency')} "
+            f"| {cell(m, 'evidence_recall')} "
+            f"| {cell(m, 'evidence_precision')} | {graded(m)} |"
         )
-    missing = sorted(n for n, m in summary.items() if not m.get("evidence_n"))
     lines += [
         "",
         "_The only numbers here that do not move when the judge model changes. "
         "A low score with high recall means the store found the evidence and "
         "the agent fumbled it; a low score with low recall is a memory "
         "failure._",
+        "",
+        "_Turn grain asks whether the store surfaced the sentence that carries "
+        "the answer; session grain asks only whether it surfaced the session "
+        "containing it. On LongMemEval `oracle` the second question is already "
+        "answered by the corpus -- every haystack session is a gold session -- "
+        "so read the turn columns and treat the session ones as the floor._",
     ]
+    if any("/" in graded(m) for _, m in rows):
+        lines += [
+            "",
+            "_Where `Probes graded` shows two numbers, the first is how many "
+            "carried turn-level gold. The gap is LongMemEval's abstention "
+            "questions: no turn holds the answer because there is no answer, so "
+            "they are graded at session grain only rather than counted as a "
+            "miss at turn grain._",
+        ]
+    missing = sorted(
+        n
+        for n, m in summary.items()
+        if not (m.get("evidence_n") or m.get("evidence_turn_n"))
+    )
     if missing:
         lines += [
             "",
@@ -499,7 +551,7 @@ def write_charts(summary: dict, out_dir: Path, priced: bool = True) -> list[Path
         else "tokens per probe (write + read amortized)"
     )
     orders = orchestrators_in(summary)
-    markers = dict(zip(orders, ["o", "s", "^", "D", "v"]))
+    markers = dict(zip(orders, ["o", "s", "^", "D", "v", "P", "X"]))
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
     for backend in backends:
         m = summary[backend]
@@ -642,6 +694,11 @@ def save(results: list[RunResult], summary: dict, out_dir: Path) -> None:
                             "efficiency": p.evidence.efficiency,
                             "n_gold": p.evidence.n_gold,
                             "n_hit": p.evidence.n_hit,
+                            "turn_recall": p.evidence.turn_recall,
+                            "turn_precision": p.evidence.turn_precision,
+                            "turn_efficiency": p.evidence.turn_efficiency,
+                            "n_gold_turns": p.evidence.n_gold_turns,
+                            "n_hit_turns": p.evidence.n_hit_turns,
                         }
                         if p.evidence
                         else None

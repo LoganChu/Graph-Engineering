@@ -4,10 +4,12 @@ The stub still records Usage against the ledger, which means the cost
 attribution path -- the part most likely to silently break -- is covered too.
 
 It also speaks `chat()` with tool calls, so the loop and graph orchestrators run
-offline against it. Two knobs drive them: `tool_hops` is how many times the
-"model" asks to search before answering, and `assess_hops` is how many times the
-graph's assessment reports the evidence insufficient. Scripting those is what
-lets the tests assert on cycle behaviour without a model that might not cycle.
+offline against it. Four knobs drive the orchestration axis: `tool_hops` is how
+many times the "model" asks to search before answering, `assess_hops` is how
+many times the graph's assessment reports the evidence insufficient, and
+`rewrites` / `plan_parts` are the search plans `fanout` and `plan_execute` write
+up front. Scripting those is what lets the tests assert on control flow without
+a model that might simply choose not to use it.
 """
 
 from __future__ import annotations
@@ -30,6 +32,8 @@ class StubLLM:
         *,
         tool_hops: int = 1,
         assess_hops: int = 0,
+        rewrites: list[str] | None = None,
+        plan_parts: list[str] | None = None,
     ) -> None:
         self.ledger = ledger or Ledger()
         self.model = "stub"
@@ -38,6 +42,11 @@ class StubLLM:
         self.tool_hops = tool_hops
         self.assess_hops = assess_hops
         self.assessments = 0
+        # What the non-adaptive orchestrators get back when they plan their
+        # searches up front. Lists rather than counts so a test can script
+        # blanks and duplicates and watch them get dropped.
+        self.rewrites = ["rewrite one", "rewrite two"] if rewrites is None else rewrites
+        self.plan_parts = ["part one", "part two"] if plan_parts is None else plan_parts
 
     def _bill(self, phase: str, prompt: str, out: int = 20) -> None:
         self.ledger.add(
@@ -66,6 +75,12 @@ class StubLLM:
             return schema(facts=[])
         if fields == {"grade", "reason"}:
             return schema(grade="incorrect", reason="stub judge")
+        if fields == {"queries"}:
+            # fanout: every query decided before any of them run.
+            return schema(queries=list(self.rewrites))
+        if fields == {"sub_questions"}:
+            # plan_execute: the decomposition, also decided up front.
+            return schema(sub_questions=list(self.plan_parts))
         if fields == {"sufficient", "missing", "next_query"}:
             # The graph orchestrator's routing decision. Report "not yet" for
             # the scripted number of cycles, then stop -- otherwise the only

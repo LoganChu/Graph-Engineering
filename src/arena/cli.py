@@ -13,6 +13,7 @@ from . import orchestrators as _orchestrators  # noqa: F401  (registers each one
 from . import report, runner, tasks
 from .llm import DEFAULT_LOCAL_MODEL, DEFAULT_MODEL, ModelConfig, credentials_present
 from .memory import available, get_backend
+from .providers import load_dotenv, resolve_api_key
 from .orchestration import DEFAULT_MAX_HOPS
 from .orchestration import available as available_orchestrators
 from .orchestration import get_orchestrator
@@ -74,8 +75,21 @@ def check_endpoint(provider: str, base_url: str | None, models: set[str]) -> str
         return "Local providers need the extra: uv sync --extra local"
 
     try:
-        client = OpenAI(base_url=base_url, api_key="not-needed", timeout=10.0)
+        key = resolve_api_key()
+        client = OpenAI(
+            base_url=base_url,
+            api_key=key,
+            timeout=10.0,
+            # Same reason as the provider: an APIM gateway wants the header
+            # form, and a preflight that cannot authenticate would report a
+            # reachable endpoint as unreachable.
+            default_headers={"api-key": key} if key != "not-needed" else None,
+        )
+        # Ollama serves `name` and `name:latest` interchangeably but only ever
+        # reports the tagged form, so compare on both or a valid model reads as
+        # missing and the run refuses to start.
         served = {m.id for m in client.models.list().data}
+        served |= {m.split(":", 1)[0] for m in served}
     except Exception as exc:
         return (
             f"Could not reach a local model server at {base_url} ({exc}). "
@@ -100,13 +114,18 @@ def preflight(config: ModelConfig) -> str | None:
     """
     judge_provider = config.judge_provider or config.provider
     judge_model = config.judge_model or config.model
+    # `or config.base_url` mirrors how LLM builds the judge transport. The
+    # endpoints are only the same when the URL matches too: a local agent with a
+    # cloud judge is "local" on both sides, and grouping on the provider name
+    # alone sent the judge's model to be looked for on the agent's server.
+    judge_base_url = config.judge_base_url or config.base_url
 
-    if judge_provider == config.provider:
+    if judge_provider == config.provider and judge_base_url == config.base_url:
         return check_endpoint(
             config.provider, config.base_url, {config.model, judge_model}
         )
     return check_endpoint(config.provider, config.base_url, {config.model}) or (
-        check_endpoint(judge_provider, config.judge_base_url, {judge_model})
+        check_endpoint(judge_provider, judge_base_url, {judge_model})
     )
 
 
@@ -303,12 +322,24 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                 console.print(f"   searched: {' -> '.join(repr(q) for q in queries)}")
             # Retrieval recall separates the two failures the answer cannot:
             # recall 1.0 means the evidence was in front of the model and it
-            # still got this wrong.
+            # still got this wrong. Turn grain leads where the corpus supports
+            # it -- "found the right session" is a much weaker claim than
+            # "found the turn that says it".
             ev = probe.get("evidence")
             if ev:
+                parts = []
+                if ev.get("n_gold_turns"):
+                    parts.append(
+                        f"turn recall={ev['turn_recall']:.2f} "
+                        f"({ev['n_hit_turns']}/{ev['n_gold_turns']} gold turns)"
+                    )
+                if ev.get("n_gold"):
+                    parts.append(
+                        f"session recall={ev['recall']:.2f} "
+                        f"({ev['n_hit']}/{ev['n_gold']} gold sessions)"
+                    )
                 console.print(
-                    f"   evidence: recall={ev['recall']:.2f} "
-                    f"({ev['n_hit']}/{ev['n_gold']} gold sessions), "
+                    f"   evidence: {', '.join(parts)}, "
                     f"stopped={probe.get('stop', '?')}"
                 )
             console.print(f"   [dim]{probe['reason']}[/dim]")
@@ -343,6 +374,9 @@ def add_model_flags(parser: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # `.env.example` has always advertised this file; nothing read it. Real
+    # exported variables still win -- the file is only the fallback.
+    load_dotenv()
     parser = argparse.ArgumentParser(
         prog="arena", description="Benchmark agent memory architectures."
     )

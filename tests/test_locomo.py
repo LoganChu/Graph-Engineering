@@ -108,13 +108,32 @@ class TestToTask:
         task = to_task(instance())
         assert task["probes"][0]["gold_sessions"] == ["D2"]
 
+    def test_turns_carry_their_dia_id_as_the_ref(self):
+        """LoCoMo needs no synthesised turn id: `evidence` already names these."""
+        task = to_task(instance())
+        assert [t["ref"] for t in task["turns"]] == ["D2:1", "D1:1"]
+
+    def test_evidence_rides_through_at_turn_grain(self):
+        task = to_task(instance())
+        assert task["probes"][0]["gold_turns"] == ["D2:1"]
+
     def test_unresolvable_evidence_is_dropped(self):
-        """9 of LoCoMo's ~2,800 evidence ids point at turns that are not in the
+        """9 of LoCoMo's 2,815 evidence ids point at turns that are not in the
         transcript. Grading a store on retrieving those is grading it against
         something no backend could satisfy."""
         inst = instance()
         inst["qa"][0]["evidence"] = ["D2:1", "D99:1"]
-        assert to_task(inst)["probes"][0]["gold_sessions"] == ["D2"]
+        probe = to_task(inst)["probes"][0]
+        assert probe["gold_sessions"] == ["D2"]
+        assert probe["gold_turns"] == ["D2:1"]
+
+    def test_a_turn_dropped_for_being_empty_cannot_be_gold(self):
+        """Image-less, text-less turns never reach the store, so gold must not
+        name them -- the loader rejects a probe that does."""
+        inst = instance()
+        inst["conversation"]["session_2"] = [turn("D2:1", text="")]
+        probe = to_task(inst)["probes"][0]
+        assert probe["gold_turns"] == []
 
     def test_probes_fire_after_every_turn(self):
         task = to_task(instance())
@@ -240,4 +259,6 @@ class TestLoadsThroughTheHarness:
         assert task.task_id == "conv-1"
         assert [e.text for e in task.events] == ["earlier turn", "later turn"]
         assert task.events[0].session_id == "D2"
+        assert task.events[0].ref == "D2:1"
         assert task.probes[0].gold_sessions == ("D2",)
+        assert task.probes[0].gold_turns == ("D2:1",)

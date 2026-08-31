@@ -15,11 +15,13 @@ Three structural differences from `longmemeval.py`, each of which matters:
     roughly 8x more probe per extraction call, and it is the reason the full
     LoCoMo port is affordable where the full LongMemEval `s` split is not.
 
-  * **Retrieval is gradeable at turn granularity.** LongMemEval annotates gold
-    at session level (`answer_session_ids`); LoCoMo annotates it at *turn* level
-    (`evidence: ['D1:3']`). We currently grade at session granularity because
-    that is what `evidence.py` consumes, so the extra precision is deliberately
-    left on the table -- see the note on `gold_sessions` below.
+  * **Gold arrives already at turn granularity.** LoCoMo annotates evidence as
+    turn ids (`evidence: ['D1:3']`), where LongMemEval's `answer_session_ids` is
+    session-level and its turn-level `has_answer` flag has to be read off the
+    turns themselves. Both are threaded through to `evidence.py` now, so a
+    LoCoMo `dia_id` rides onto the turn as its `ref` and onto the probe as
+    `gold_turns`; `gold_sessions` is derived from the same ids and kept as the
+    coarse column.
 
   * **It supplies distractors.** Category 5 questions are adversarial: the
     question attributes an event to the wrong speaker, and `adversarial_answer`
@@ -162,7 +164,8 @@ def to_task(instance: dict[str, Any]) -> dict[str, Any]:
             if not text:
                 continue
             dia_id = str(turn.get("dia_id", ""))
-            dia_to_session[dia_id] = session_id
+            if dia_id:
+                dia_to_session[dia_id] = session_id
             present.add(session_id)
             turns.append(
                 {
@@ -170,6 +173,10 @@ def to_task(instance: dict[str, Any]) -> dict[str, Any]:
                     "speaker": turn.get("speaker", "user"),
                     "text": text,
                     "session": session_id,
+                    # LoCoMo's own turn id, which is exactly what `evidence`
+                    # names. No id has to be synthesised here the way it does
+                    # for LongMemEval.
+                    "ref": dia_id,
                 }
             )
 
@@ -184,23 +191,22 @@ def to_task(instance: dict[str, Any]) -> dict[str, Any]:
         if kind is None:  # category 3, or anything the dataset adds later
             continue
 
-        # Gold is intersected with the sessions actually built above: 9 of
-        # LoCoMo's ~2,800 evidence ids point at turns that are not in the
+        # Gold is intersected with the turns actually built above: 9 of
+        # LoCoMo's 2,815 evidence ids point at turns that are not in the
         # transcript, and grading a store on retrieving those would be scoring
-        # it against something no backend could satisfy.
-        gold = sorted(
-            {
-                dia_to_session[e]
-                for e in (qa.get("evidence") or [])
-                if str(e) in dia_to_session
-            }
+        # it against something no backend could satisfy. That intersection
+        # leaves exactly two of the 1,890 mapped questions with no gold at all.
+        gold_turns = sorted(
+            {str(e) for e in (qa.get("evidence") or []) if str(e) in dia_to_session}
         )
+        gold = sorted({dia_to_session[e] for e in gold_turns})
 
         probe: dict[str, Any] = {
             "after_turn": len(turns),
             "type": kind,
             "question": qa["question"],
             "gold_sessions": gold,
+            "gold_turns": gold_turns,
         }
         if kind == "negation":
             probe["expected"] = ABSTAIN

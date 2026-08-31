@@ -89,6 +89,39 @@ class TestToTask:
     def test_description_counts_evidence_sessions(self):
         assert "1 carrying evidence" in to_task(instance())["description"]
 
+    def test_turn_refs_are_session_plus_position(self):
+        """Stable across a rebuild in a way a flattened-haystack index is not."""
+        task = to_task(instance())
+        assert [t["ref"] for t in task["turns"]] == ["s_b:0", "s_a:0"]
+
+    def test_has_answer_becomes_turn_level_gold(self):
+        task = to_task(instance())
+        assert task["probes"][0]["gold_turns"] == ["s_a:0"]
+        assert task["probes"][0]["gold_sessions"] == ["s_a"]
+
+    def test_every_flagged_turn_lies_inside_a_gold_session(self):
+        """True of all 500 upstream instances; a build that broke it would lie."""
+        task = to_task(instance())
+        probe = task["probes"][0]
+        sessions = {t["session"] for t in task["turns"] if t["ref"] in probe["gold_turns"]}
+        assert sessions <= set(probe["gold_sessions"])
+
+    def test_abstention_with_no_flagged_turn_keeps_its_session_gold(self):
+        """21 of the 30 `_abs` instances flag nothing: there is no answer turn."""
+        task = to_task(
+            instance(
+                question_id="gpt4_deadbeef_abs",
+                haystack_sessions=[
+                    [{"role": "user", "content": "later turn"}],
+                    [{"role": "assistant", "content": "earlier turn"}],
+                ],
+            )
+        )
+        probe = task["probes"][0]
+        assert probe["type"] == "negation"
+        assert probe["gold_turns"] == []
+        assert probe["gold_sessions"] == ["s_a"]
+
     def test_round_trips_through_the_real_loader(self, tmp_path):
         """The converter's only contract is that `tasks.load_task` accepts it."""
         task = to_task(instance())
@@ -102,6 +135,8 @@ class TestToTask:
         assert loaded.events[0].at == date(2023, 1, 3)
         assert loaded.probes[0].type == "simple_recall"
         assert loaded.probes[0].must_not_contain == ()
+        assert loaded.probes[0].gold_turns == ("s_a:0",)
+        assert [e.ref for e in loaded.events] == ["s_b:0", "s_a:0"]
 
 
 class TestStratified:

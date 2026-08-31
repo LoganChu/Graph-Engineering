@@ -21,8 +21,10 @@ model that gets it right first try, and the report should say so.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
@@ -154,12 +156,65 @@ def coerce(text: str, schema: type[BaseModel]) -> BaseModel | None:
         return None
 
 
+def example_for(node: dict, defs: dict | None = None) -> Any:
+    """A filled-in instance of a JSON Schema node, for showing rather than telling."""
+    defs = defs if defs is not None else {}
+    if "$ref" in node:
+        return example_for(defs.get(node["$ref"].rsplit("/", 1)[-1], {}), defs)
+    for key in ("anyOf", "oneOf", "allOf"):
+        if node.get(key):
+            return example_for(node[key][0], defs)
+    kind = node.get("type")
+    if kind == "object":
+        return {
+            name: example_for(sub, defs)
+            for name, sub in (node.get("properties") or {}).items()
+        }
+    if kind == "array":
+        return [example_for(node.get("items") or {}, defs), "..."]
+    if kind == "boolean":
+        return True
+    if kind in ("integer", "number"):
+        return 0
+    return "..."
+
+
 def schema_instruction(schema: type[BaseModel]) -> str:
-    return (
+    """Show the shape; do not paste the schema.
+
+    Pasting the JSON Schema puts a JSON object in the prompt and then asks for a
+    JSON object, and smaller models resolve that ambiguity by handing the schema
+    straight back: llama3.2:3b returns it verbatim, qwen3.5 buries the real
+    answer one level down under `properties`. Measured on qwen3.5 9B, this
+    instruction style takes `Rewrites` from 0/3 to 3/3 valid.
+
+    Constrained decoding fixes the same failure at the sampler and is strictly
+    better where it applies -- but Ollama does not honour it for every model, so
+    this is what defends the models it drops.
+
+    Field descriptions still have to reach the model, since they carry which
+    fact belongs in which slot. They come as a plain list rather than as the
+    nested blob that caused the problem.
+    """
+    spec = schema.model_json_schema()
+    defs = spec.get("$defs", {})
+    lines = [
         "Respond with a single JSON object and nothing else -- no prose, no "
-        "markdown fence, no explanation. It must validate against this JSON "
-        f"Schema:\n{json.dumps(schema.model_json_schema(), indent=2)}"
-    )
+        "markdown fence, no explanation.",
+        "",
+        "Shape:",
+        json.dumps(example_for(spec, defs), indent=2),
+    ]
+    described = [
+        (name, sub.get("description", ""))
+        for name, sub in (spec.get("properties") or {}).items()
+    ]
+    if any(desc for _, desc in described):
+        lines += ["", "Fields:"]
+        lines += [f"  {name} -- {desc}" for name, desc in described if desc]
+    if spec.get("required"):
+        lines += ["", f"Required: {', '.join(spec['required'])}"]
+    return "\n".join(lines)
 
 
 # -- Anthropic ----------------------------------------------------------------
@@ -316,6 +371,88 @@ class AnthropicProvider:
 
 # -- OpenAI-compatible (Ollama, LM Studio, llama.cpp, vLLM) -------------------
 
+#: Substrings that mark a server *rejecting the concept* of
+#: `response_format: json_schema`, rather than rejecting this particular
+#: request. Only these downgrade the session to prompt-and-validate. Anything
+#: else -- a context overflow, an auth failure, a rate limit -- is re-raised,
+#: because quietly answering under a weaker decoding mode is the same class of
+#: bug this change exists to remove.
+_NO_JSON_SCHEMA = ("json_schema", "response_format", "structured output")
+
+
+#: The dialect differences `_create` knows how to recover from. Named here so
+#: the retry bound and the give-up message cannot drift apart.
+_ADAPTATIONS = ("json_schema", "max_completion_tokens", "temperature")
+
+
+def rejects_max_tokens(exc: Exception) -> bool:
+    """Azure's GPT-5 family renamed the field and says so in the error."""
+    text = str(exc).lower()
+    return "max_tokens" in text and "max_completion_tokens" in text
+
+
+def rejects_temperature(exc: Exception) -> bool:
+    """Reasoning models that allow only the default sampling temperature."""
+    text = str(exc).lower()
+    return "temperature" in text and (
+        "unsupported" in text or "does not support" in text
+    )
+
+
+def rejects_json_schema(exc: Exception) -> bool:
+    """Did the server refuse constrained decoding itself, or refuse the call?"""
+    text = str(exc).lower()
+    return any(marker in text for marker in _NO_JSON_SCHEMA)
+
+
+#: Env vars checked, in order, for a key to send to an OpenAI-compatible
+#: endpoint. A local Ollama needs none, which is why the fallback is a
+#: placeholder rather than an error: the server ignores whatever is sent.
+API_KEY_VARS = ("ARENA_JUDGE_API_KEY", "ARENA_API_KEY", "OPENAI_API_KEY")
+
+
+def dotenv_values(path: Path = Path(".env")) -> dict[str, str]:
+    """`KEY=value` lines from a .env file. No dependency, and no cleverness.
+
+    Deliberately not python-dotenv: no interpolation, no `export` prefix, no
+    multi-line values. `.env.example` has always implied this file is where
+    keys live, and until now nothing read it -- which mattered because the
+    environment cannot always be relied on to carry them in.
+    """
+    found: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return found
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        found[key.strip()] = value.strip().strip("'\"")
+    return found
+
+
+def load_dotenv(path: Path = Path(".env")) -> None:
+    """Copy .env into the process environment without overriding what is set.
+
+    A real exported variable always wins: the file is the fallback, so a run
+    can be steered from the shell without editing it.
+    """
+    for key, value in dotenv_values(path).items():
+        os.environ.setdefault(key, value)
+
+
+def resolve_api_key() -> str:
+    """The key for an OpenAI-compatible endpoint, environment or .env."""
+    for source in (os.environ, dotenv_values()):
+        for var in API_KEY_VARS:
+            value = source.get(var)
+            if value:
+                return value
+    return "not-needed"
+
+
 REPAIR = """\
 Your previous response was not valid JSON for the required schema.
 
@@ -364,6 +501,17 @@ class OpenAICompatProvider:
     context_limit: int = 4096
     peak_prompt_tokens: int = 0
     context_warnings: int = 0
+    #: Tri-state: None until a schema call has been tried, then latched. Probing
+    #: once per session and remembering it keeps a server that cannot do
+    #: constrained decoding from paying a failed round trip on every parse.
+    supports_json_schema: bool | None = None
+    #: Two more dialect differences this class discovers rather than being
+    #: configured with. Azure's GPT-5 family renamed `max_tokens` and refuses
+    #: any temperature but its default; Ollama accepts both. Each is latched on
+    #: the first rejection, so a session pays one failed round trip rather than
+    #: one per call, and no flag has to be threaded through the CLI for it.
+    token_param: str = "max_tokens"
+    supports_temperature: bool = True
 
     def __init__(
         self,
@@ -378,7 +526,17 @@ class OpenAICompatProvider:
             raise RuntimeError(
                 "Local providers need the 'local' extra. Run: uv sync --extra local"
             ) from exc
-        self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+        # Azure API Management authenticates on an `api-key` header and 401s a
+        # bearer token; OpenAI and Ollama want the bearer and ignore unknown
+        # headers. Sending both satisfies all three without asking the caller
+        # which flavour of endpoint they pointed us at.
+        headers = {"api-key": api_key} if api_key and api_key != "not-needed" else None
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            default_headers=headers,
+        )
         self.base_url = base_url
         self.context_limit = context_limit
         #: Largest prompt seen, so a run can report its actual headroom.
@@ -397,6 +555,46 @@ class OpenAICompatProvider:
                     flush=True,
                 )
 
+    def _create(self, kwargs: dict[str, Any], *, constrained: bool, json_mode: bool):
+        """One request, retried against the dialects servers actually differ on.
+
+        Every branch here is a difference that is *reported by the server* --
+        never guessed from a URL or a model name, because those are exactly the
+        heuristics that rot. A rejection this does not recognise is re-raised
+        untouched: silently answering a weaker question is the failure mode the
+        constrained-decoding work exists to remove, and it would be perverse to
+        reintroduce it here.
+        """
+        for _ in range(len(_ADAPTATIONS) + 1):
+            try:
+                response = self.client.chat.completions.create(**kwargs)
+                if constrained:
+                    self.supports_json_schema = True
+                return response
+            except Exception as exc:
+                if constrained and rejects_json_schema(exc):
+                    # Older Ollama, LM Studio, llama.cpp: no grammar support.
+                    self.supports_json_schema = False
+                    constrained = False
+                    if json_mode:
+                        kwargs["response_format"] = {"type": "json_object"}
+                    else:
+                        kwargs.pop("response_format", None)
+                    continue
+                if "max_tokens" in kwargs and rejects_max_tokens(exc):
+                    self.token_param = "max_completion_tokens"
+                    kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                    continue
+                if "temperature" in kwargs and rejects_temperature(exc):
+                    self.supports_temperature = False
+                    kwargs.pop("temperature")
+                    continue
+                raise
+        raise RuntimeError(
+            "no request dialect this server accepts: tried "
+            f"{', '.join(_ADAPTATIONS)}"
+        )
+
     def _chat(
         self,
         *,
@@ -406,6 +604,7 @@ class OpenAICompatProvider:
         max_tokens: int,
         effort: str = "low",
         json_mode: bool = False,
+        schema: type[BaseModel] | None = None,
     ) -> Completion:
         messages: list[dict[str, str]] = []
         if system:
@@ -415,16 +614,37 @@ class OpenAICompatProvider:
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0,  # local models still expose this; pin it
+            self.token_param: max_tokens,
             "reasoning_effort": REASONING_EFFORT.get(effort, "none"),
         }
-        if json_mode:
+        if self.supports_temperature:
+            kwargs["temperature"] = 0  # local models expose this; pin it
+        # Constrained decoding, when the server can do it: the schema is
+        # compiled to a grammar and the sampler masked to it, so a
+        # non-conforming object is unreachable rather than merely discouraged.
+        # This is the whole difference between a 3B model being unusable here
+        # and being fine. Under plain `json_object` the prompt contains a JSON
+        # object (the schema) and asks for a JSON object, and small models
+        # resolve that by echoing the schema back -- which used to validate.
+        constrained = schema is not None and self.supports_json_schema is not False
+        if constrained:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                # No `strict`: it would require every property in `required` and
+                # `additionalProperties: false`, which several of these schemas
+                # deliberately violate by giving fields defaults. Ollama
+                # constrains on the grammar either way.
+                "json_schema": {
+                    "name": schema.__name__,
+                    "schema": schema.model_json_schema(),
+                },
+            }
+        elif json_mode:
             # Widely supported; servers that do not know it ignore it, which is
             # why the balanced-brace salvage below is not optional.
             kwargs["response_format"] = {"type": "json_object"}
 
-        response = self.client.chat.completions.create(**kwargs)
+        response = self._create(kwargs, constrained=constrained, json_mode=json_mode)
         usage = response.usage
         prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
         self._note_prompt_size(prompt_tokens, model)
@@ -460,12 +680,16 @@ class OpenAICompatProvider:
         max_tokens: int,
     ) -> tuple[BaseModel, Completion]:
         instruction = schema_instruction(schema)
+        # The instruction stays even when decoding is constrained: the grammar
+        # fixes the shape, but the field descriptions are what tell the model
+        # which fact belongs in which slot. Structure and intent are separate.
         first = self._chat(
             model=model,
             prompt=f"{prompt}\n\n{instruction}",
             system=system,
             max_tokens=max_tokens,
             json_mode=True,
+            schema=schema,
         )
         parsed = coerce(first.text, schema)
         if parsed is not None:
@@ -477,6 +701,7 @@ class OpenAICompatProvider:
             system=system,
             max_tokens=max_tokens,
             json_mode=True,
+            schema=schema,
         )
         billed = Completion(
             text=second.text,
@@ -600,9 +825,16 @@ class OpenAICompatProvider:
         )
 
 
-def build(provider: str, base_url: str | None = None) -> Provider:
+def build(
+    provider: str, base_url: str | None = None, api_key: str | None = None
+) -> Provider:
     if provider == "anthropic":
         return AnthropicProvider()
     if provider in ("local", "ollama", "openai-compat"):
-        return OpenAICompatProvider(base_url=base_url or "http://localhost:11434/v1")
+        # Until now this passed no key at all, which made every remote
+        # OpenAI-compatible endpoint unreachable no matter what was configured.
+        return OpenAICompatProvider(
+            base_url=base_url or "http://localhost:11434/v1",
+            api_key=api_key or resolve_api_key(),
+        )
     raise ValueError(f"unknown provider {provider!r}")

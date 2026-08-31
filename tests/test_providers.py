@@ -87,7 +87,7 @@ class TestOpenAICompatProvider:
         provider.base_url = "http://fake"
         calls: list[str] = []
 
-        def fake_chat(*, model, prompt, system, max_tokens, json_mode=False):
+        def fake_chat(*, model, prompt, system, max_tokens, json_mode=False, schema=None):
             calls.append(prompt)
             return Completion(text=replies[len(calls) - 1], input_tokens=10, output_tokens=5)
 
