@@ -27,24 +27,42 @@ Extract factual triples from this conversation turn.
 
 Turn (dated {when}), spoken by {speaker}: {text}
 
+These are conversations in which one person talks about their own life, so most
+facts are about {speaker}: what they did, went to, attended, bought, read,
+learned, decided, prefer, or plan. A turn whose main purpose is asking a
+question almost always states facts on the way to the question. Extract those;
+the question itself is not a fact.
+
 Rules:
-- The SUBJECT is the entity the statement is about. This is often NOT the
-  speaker. "Checkout service paged at 3am" is about the checkout service, not
-  about {speaker}. Only use the speaker as the subject when the statement is
-  about them ("I moved to Boston" -> subject is {speaker}).
-- Resolve first-person pronouns to {speaker}. Resolve other pronouns to the
-  entity they refer to if it is unambiguous; skip the triple if it is not.
+- The SUBJECT is the entity the statement is about. Resolve first-person
+  pronouns to {speaker}. Resolve other pronouns only when unambiguous, and skip
+  the triple otherwise. When the statement is about something else, use that
+  instead ("Sam owns checkout now" -> subject is sam).
 - The RELATION is a short lowercase verb phrase drawn from the turn's own
   wording. Do not force the statement into a vocabulary the turn does not use.
-- The OBJECT is a short noun phrase or literal value. Keep it under six words.
-- Extract only what this turn asserts. No inference, no world knowledge. If the
-  turn asserts nothing factual, return an empty list.
+- The OBJECT is a short noun phrase or literal value, under six words. Keep
+  dates, durations and quantities verbatim -- they are usually the point of the
+  fact, not decoration.
+- Extract only what this turn asserts. No inference, no world knowledge. A
+  technical or specialist topic is not world knowledge when the speaker says
+  they did something with it: "I read the Raft paper" asserts that they read it.
 - Split compound statements into separate triples.
 
-Example turn: "Checkout paged again, same latency shape as before. Sam owns it now."
-Example output: two triples --
-  (checkout, paged, again) and (sam, owns, checkout)
-Note that neither triple is anchored on the speaker."""
+Examples.
+
+Turn: "I finally moved from Durham to New York last month, and started at Stripe."
+  ({speaker}, moved from, Durham)
+  ({speaker}, moved to, New York)
+  ({speaker}, started at, Stripe)
+
+Turn: "I went to my niece's graduation on the 3rd of June and ended up giving a
+short speech, which I hadn't planned. Any tips for next time?"
+  ({speaker}, went to, niece's graduation)
+  ({speaker}, went to graduation on, 3rd of June)
+  ({speaker}, gave, short speech)
+
+Turn: "Thanks, that makes sense. I'll give it a try."
+  no facts -- return an empty list"""
 
 
 class Fact(BaseModel):
